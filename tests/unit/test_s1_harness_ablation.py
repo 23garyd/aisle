@@ -1,10 +1,12 @@
 """Unit tests for the S1 harness-versus-script neutral attempt schema."""
 
 import json
+import shutil
 import signal
 import subprocess
 import sys
 from contextlib import redirect_stdout
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 
@@ -1205,3 +1207,634 @@ def test_script_adapter_preflight_failure_measures_elapsed_wall_time(tmp_path: P
     result = ScriptAdapter(preflight_runner=timeout, clock=lambda: next(ticks)).preflight(candidate)
 
     assert result.to_dict() == {"ok": False, "errors": [{"code": "INFRA_TIMEOUT"}], "wall_s": 0.75}
+
+
+def _controller_runtime(
+    module,
+    *,
+    agent_lines: tuple[str, ...] | None = None,
+    adapter_factory=None,
+    frozen_drift: tuple[str, ...] = (),
+):
+    """Fixture-only controller boundaries: no agent, simulator, or environment sync."""
+    lines = agent_lines
+    if lines is None:
+        lines = (
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 3,
+                            "cache_creation_input_tokens": 2,
+                            "output_tokens": 1,
+                        }
+                    },
+                }
+            )
+            + "\n",
+        )
+
+    def create_worktree(pin: str, destination: Path) -> Path:
+        assert pin == "a" * 40
+        for relative in (
+            "graphs/ablation_s1_starter.yaml",
+            "baselines/script_s1/starter.py",
+            "harness/budget.toml",
+        ):
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REPO_ROOT / relative, target)
+        return destination
+
+    def execute(command, cwd, agent, on_line, stop_reason, wall_ceiling_s):
+        assert command and cwd.is_dir() and agent in {"claude", "codex"}
+        assert wall_ceiling_s <= 4 * 3600
+        try:
+            for line in lines:
+                on_line(line, 0.25)
+                reason = stop_reason(0.25)
+                if reason:
+                    return module.ExecutionResult(
+                        stopped=reason,
+                        returncode=-signal.SIGKILL,
+                        wall_s=0.25,
+                        agent_version="fixture-agent-1",
+                    )
+        except module.TelemetryError:
+            return module.ExecutionResult(
+                stopped="telemetry_invalid",
+                returncode=-signal.SIGKILL,
+                wall_s=0.25,
+                agent_version="fixture-agent-1",
+            )
+        return module.ExecutionResult(
+            stopped="agent_done",
+            returncode=0,
+            wall_s=0.25,
+            agent_version="fixture-agent-1",
+        )
+
+    return module.ControllerRuntime(
+        resolve_pin=lambda repo, pin: "a" * 40,
+        create_worktree=create_worktree,
+        execute_agent=execute,
+        adapter_factory=adapter_factory or module.default_adapter_factory,
+        audit_frozen=lambda worktree, pin: list(frozen_drift),
+        worktree_head=lambda worktree: "a" * 40,
+        worktree_status=lambda worktree: [],
+        epoch_time=lambda: 1_800_000_000.0,
+    )
+
+
+def _invoke_controller(module, argv: list[str], runtime) -> tuple[int, dict, str, str]:
+    stdout = StringIO()
+    stderr = StringIO()
+    with redirect_stdout(stdout), pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(sys, "stderr", stderr)
+        returncode = module.main(argv, runtime=runtime, repo_root=REPO_ROOT)
+    output = stdout.getvalue()
+    decoder = json.JSONDecoder()
+    result, end = decoder.raw_decode(output)
+    assert isinstance(result, dict)
+    assert output[end:].strip() == ""
+    assert output.endswith("\n")
+    return returncode, result, output, stderr.getvalue()
+
+
+def _prepare_controller_campaign(module, tmp_path: Path, *, pairs: int = 1, runtime=None):
+    campaign = tmp_path / "campaign"
+    runtime = runtime or _controller_runtime(module)
+    returncode, result, _, _ = _invoke_controller(
+        module,
+        [
+            "prepare",
+            "--pin",
+            "fixture-pin",
+            "--pairs",
+            str(pairs),
+            "--assignment-seed",
+            "17",
+            "--out",
+            str(campaign),
+        ],
+        runtime,
+    )
+    assert returncode == 0 and result["ok"] is True
+    return campaign, result, runtime
+
+
+def _run_prepared_controller_session(module, session_dir: Path, runtime):
+    session = json.loads((session_dir / "session.json").read_text())
+    return _invoke_controller(
+        module,
+        [
+            "run",
+            "--session",
+            str(session_dir),
+            "--condition",
+            session["condition"],
+            "--agent",
+            "claude",
+            "--model",
+            "fixture-model",
+            "--tokens",
+            "500000",
+            "--episodes",
+            "40",
+            "--wall-h",
+            "4",
+        ],
+        runtime,
+    )
+
+
+def test_controller_prepare_is_deterministic_paired_and_copies_only_assigned_surface(
+    tmp_path: Path,
+):
+    """CON-5, CON-7: preparation is paired, pinned, isolated, and outcome-blind."""
+    from tools import s1_harness_ablation as controller
+
+    first, first_result, runtime = _prepare_controller_campaign(
+        controller, tmp_path / "first", pairs=3
+    )
+    second, second_result, _ = _prepare_controller_campaign(
+        controller, tmp_path / "second", pairs=3, runtime=runtime
+    )
+
+    assert first_result["assignments"] == second_result["assignments"]
+    assert len(first_result["assignments"]) == 6
+    assert all(
+        set(first_result["assignments"][index : index + 2]) == {"aisle", "script"}
+        for index in range(0, 6, 2)
+    )
+    first_sessions = sorted(first.glob("S*"))
+    second_sessions = sorted(second.glob("S*"))
+    assert [(path / "session.json").read_bytes() for path in first_sessions] == [
+        (path / "session.json").read_bytes() for path in second_sessions
+    ]
+    for session_dir in first_sessions:
+        record = json.loads((session_dir / "session.json").read_text())
+        assert "outcome" not in record and record["state"] == "prepared"
+        assert record["pin"] == "a" * 40
+        assert set(path.name for path in session_dir.iterdir() if path.is_file()) == {
+            "session.json",
+            "attempts.jsonl",
+            "agent.jsonl",
+            "token_samples.jsonl",
+            "holdout.json",
+            "audit.json",
+        }
+        aisle_candidate = session_dir / "worktree" / "graphs" / "agent_s1_ablation.yaml"
+        script_candidate = session_dir / "worktree" / "baselines" / "script_s1" / "candidate.py"
+        assert aisle_candidate.exists() == (record["condition"] == "aisle")
+        assert script_candidate.exists() == (record["condition"] == "script")
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--tokens", "500001"),
+        ("--episodes", "41"),
+        ("--wall-h", "4.0001"),
+    ],
+)
+def test_controller_refuses_any_budget_above_the_frozen_ceiling(
+    tmp_path: Path, option: str, value: str
+):
+    """CON-7, CON-8: an operator cannot raise token, episode, or wall ceilings."""
+    from tools import s1_harness_ablation as controller
+
+    campaign, result, runtime = _prepare_controller_campaign(controller, tmp_path)
+    session_dir = campaign / result["sessions"][0]
+    session = json.loads((session_dir / "session.json").read_text())
+    argv = [
+        "run",
+        "--session",
+        str(session_dir),
+        "--condition",
+        session["condition"],
+        "--agent",
+        "claude",
+        "--model",
+        "fixture-model",
+        "--tokens",
+        "500000",
+        "--episodes",
+        "40",
+        "--wall-h",
+        "4",
+    ]
+    argv[argv.index(option) + 1] = value
+
+    returncode, response, _, _ = _invoke_controller(controller, argv, runtime)
+
+    assert returncode == 1
+    assert response["ok"] is False
+    assert response["code"] == "BUDGET_LIMIT"
+    assert json.loads((session_dir / "session.json").read_text())["state"] == "prepared"
+
+
+def test_controller_condition_is_immutable_after_session_start(tmp_path: Path):
+    """CON-5: assigned treatment cannot change after the external session starts."""
+    from tools import s1_harness_ablation as controller
+
+    campaign, result, runtime = _prepare_controller_campaign(controller, tmp_path)
+    session_dir = campaign / result["sessions"][0]
+    returncode, response, _, _ = _run_prepared_controller_session(controller, session_dir, runtime)
+    assert returncode == 0 and response["ok"] is True
+    assigned = json.loads((session_dir / "session.json").read_text())["condition"]
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        [
+            "run",
+            "--session",
+            str(session_dir),
+            "--condition",
+            "script" if assigned == "aisle" else "aisle",
+            "--agent",
+            "claude",
+            "--model",
+            "fixture-model",
+            "--tokens",
+            "500000",
+            "--episodes",
+            "40",
+            "--wall-h",
+            "4",
+        ],
+        runtime,
+    )
+
+    assert returncode == 1
+    assert response["code"] == "CONDITION_IMMUTABLE"
+
+
+def test_controller_refuses_heldout_scoring_before_agent_stop(tmp_path: Path):
+    """CON-5, CON-8: held-out seeds remain external until the agent process stops."""
+    from tools import s1_harness_ablation as controller
+
+    campaign, result, runtime = _prepare_controller_campaign(controller, tmp_path)
+    session_dir = campaign / result["sessions"][0]
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["score", "--session", str(session_dir), "--holdout", "100..107"],
+        runtime,
+    )
+
+    assert returncode == 1
+    assert response["code"] == "AGENT_NOT_STOPPED"
+    assert json.loads((session_dir / "holdout.json").read_text()) == {
+        "ok": False,
+        "state": "pending",
+    }
+
+
+def test_controller_refuses_nonheldout_or_overlapping_score_seeds(tmp_path: Path):
+    """CON-5, CON-8: development/regression seeds can never enter external scoring."""
+    from tools import s1_harness_ablation as controller
+
+    campaign, result, runtime = _prepare_controller_campaign(controller, tmp_path)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["score", "--session", str(session_dir), "--holdout", "0..7"],
+        runtime,
+    )
+
+    assert returncode == 1
+    assert response["code"] == "SEED_DOMAIN"
+
+
+def test_controller_scores_no_deliverable_as_explicit_zero(tmp_path: Path):
+    """CON-5: a stopped clean session without a deliverable has held-out pass@1 zero."""
+    from tools import s1_harness_ablation as controller
+
+    campaign, result, runtime = _prepare_controller_campaign(controller, tmp_path)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+    record = json.loads((session_dir / "session.json").read_text())
+    (session_dir / record["candidate"]).unlink()
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["score", "--session", str(session_dir), "--holdout", "100..107"],
+        runtime,
+    )
+
+    assert returncode == 0
+    assert response["ok"] is True
+    assert response["outcome"] == "no_deliverable"
+    holdout = json.loads((session_dir / "holdout.json").read_text())
+    assert holdout["pass1"] == 0.0
+    assert holdout["episodes"] == []
+    assert holdout["failures"] == {}
+
+
+def test_controller_malformed_live_agent_telemetry_fails_closed(tmp_path: Path):
+    """HAR-5, CON-8: malformed live telemetry kills the agent and never implies zero spend."""
+    from tools import s1_harness_ablation as controller
+
+    runtime = _controller_runtime(controller, agent_lines=("not-json\n",))
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+
+    returncode, response, _, _ = _run_prepared_controller_session(controller, session_dir, runtime)
+
+    assert returncode == 1
+    assert response["code"] == "TELEMETRY_INVALID"
+    session = json.loads((session_dir / "session.json").read_text())
+    assert session["state"] == "agent_stopped"
+    assert session["telemetry"]["valid"] is False
+    assert session["tokens_spent"] is None
+    assert (session_dir / "token_samples.jsonl").read_text() == ""
+
+
+def test_controller_live_stream_stops_at_token_budget_and_reserves_episode_budget(
+    tmp_path: Path,
+):
+    """HAR-5, CON-7: live new-token spend and trusted rollout capacity are externally bounded."""
+    from aisle.harness.rollout import budget_remaining
+    from tools import s1_harness_ablation as controller
+
+    line = (
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "usage": {
+                        "input_tokens": 499_998,
+                        "cache_creation_input_tokens": 1,
+                        "output_tokens": 1,
+                    }
+                },
+            }
+        )
+        + "\n"
+    )
+    runtime = _controller_runtime(controller, agent_lines=(line,))
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+
+    returncode, response, _, _ = _run_prepared_controller_session(controller, session_dir, runtime)
+
+    assert returncode == 0
+    assert response["stopped"] == "token_budget"
+    assert response["tokens_spent"] == 500_000
+    assert budget_remaining(session_dir / "worktree")["episodes_left"] == 40
+
+
+def test_controller_scores_unavailable_safety_evidence_fail_closed(tmp_path: Path):
+    """CON-5, CON-7: INFRA_SAFETY_UNAVAILABLE is not inferred as held-out zero."""
+    from aisle.harness.ablation import AttemptResult, PreflightResult, SafetyResult
+    from tools import s1_harness_ablation as controller
+
+    class UnavailableSafetyAdapter:
+        def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
+            return AttemptResult(
+                attempt_id=run_id,
+                candidate_hash="b" * 64,
+                preflight=PreflightResult(ok=True, errors=(), wall_s=0.0),
+                episodes=(_episode_record(0, 100),),
+                failures={"INFRA_SAFETY_UNAVAILABLE": 1},
+                safety=SafetyResult(ungated=0, clamps=0, extra_item=0),
+                timing={"wall_s": 1.0, "sim_s": 1.0},
+                artifacts={},
+            )
+
+    runtime = _controller_runtime(
+        controller,
+        adapter_factory=lambda condition, worktree: UnavailableSafetyAdapter(),
+    )
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["score", "--session", str(session_dir), "--holdout", "100..107"],
+        runtime,
+    )
+
+    assert returncode == 1
+    assert response["code"] == "INFRA_SAFETY_UNAVAILABLE"
+    assert response["pass1"] is None
+
+
+def test_controller_scores_all_eight_heldout_seeds_and_clean_audit_passes(tmp_path: Path):
+    """CON-5, CON-7: external scoring records all held-out outcomes and verified provenance."""
+    from aisle.harness.ablation import AttemptResult, PreflightResult, SafetyResult
+    from tools import s1_harness_ablation as controller
+
+    class HeldoutAdapter:
+        def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
+            assert seeds == "100..107"
+            episodes = []
+            for index, seed in enumerate(range(100, 108)):
+                episode = _episode_record(index, seed)
+                if index < 4:
+                    episode.update(
+                        status="success",
+                        failure=None,
+                        success=True,
+                        penalties=[],
+                    )
+                episodes.append(episode)
+            return AttemptResult(
+                attempt_id=run_id,
+                candidate_hash="c" * 64,
+                preflight=PreflightResult(ok=True, errors=(), wall_s=0.1),
+                episodes=tuple(episodes),
+                failures={"timeout": 4},
+                safety=SafetyResult(ungated=0, clamps=2, extra_item=0),
+                timing={"wall_s": 8.0, "sim_s": 16.0},
+                artifacts={},
+            )
+
+    runtime = _controller_runtime(
+        controller,
+        adapter_factory=lambda condition, worktree: HeldoutAdapter(),
+    )
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["score", "--session", str(session_dir), "--holdout", "100..107"],
+        runtime,
+    )
+    assert returncode == 0
+    assert response["pass1"] == 0.5
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["audit", "--dir", str(session_dir)],
+        runtime,
+    )
+    assert returncode == 0
+    assert response["ok"] is True
+    assert json.loads((session_dir / "audit.json").read_text())["issues"] == []
+
+
+def test_controller_audit_marks_operator_frozen_and_concurrent_contamination(
+    tmp_path: Path,
+):
+    """CON-7: operator intervention, frozen drift, and overlapping sessions are exclusions."""
+    from tools import s1_harness_ablation as controller
+
+    base_runtime = _controller_runtime(controller, frozen_drift=("env/limits.toml",))
+    epochs = iter((10.0, 20.0, 15.0, 25.0))
+    runtime = replace(base_runtime, epoch_time=lambda: next(epochs))
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    for session_name in result["sessions"]:
+        _run_prepared_controller_session(controller, campaign / session_name, runtime)
+    first = campaign / result["sessions"][0]
+    first_record = json.loads((first / "session.json").read_text())
+    first_record["operator_events"] = [{"kind": "hint", "authorized": False}]
+    (first / "session.json").write_text(json.dumps(first_record))
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["audit", "--dir", str(campaign)],
+        runtime,
+    )
+
+    assert returncode == 1
+    first_audit = json.loads((first / "audit.json").read_text())
+    assert {
+        "OPERATOR_INTERVENTION",
+        "FROZEN_DRIFT",
+        "CONCURRENT_SIMULATOR",
+    }.issubset(first_audit["issues"])
+    assert response["ok"] is False
+
+
+def test_controller_audit_detects_agent_ledger_tampering(tmp_path: Path):
+    """CON-5, CON-7: audit fails a modified live-agent hash chain."""
+    from tools import s1_harness_ablation as controller
+
+    campaign, result, runtime = _prepare_controller_campaign(controller, tmp_path)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+    ledger = session_dir / "agent.jsonl"
+    ledger.write_text(ledger.read_text().replace('"input_tokens":3', '"input_tokens":4'))
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["audit", "--dir", str(campaign)],
+        runtime,
+    )
+
+    assert returncode == 1
+    assert response["ok"] is False
+    audit = json.loads((session_dir / "audit.json").read_text())
+    assert "AGENT_LEDGER_INVALID" in audit["issues"]
+
+
+def test_controller_audit_rejects_validly_chained_early_budget_release(tmp_path: Path):
+    """CON-7: semantic audit catches a forged settlement even when its chain is valid."""
+    from aisle.harness.rollout import settle_budget
+    from tools import s1_harness_ablation as controller
+
+    campaign, result, runtime = _prepare_controller_campaign(controller, tmp_path)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+    settle_budget(
+        session_dir / "worktree",
+        controller.CONTROLLER_RESERVATION,
+        episodes=0,
+        wall_s=0.0,
+    )
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["audit", "--dir", str(session_dir)],
+        runtime,
+    )
+
+    assert returncode == 1
+    assert response["ok"] is False
+    audit = json.loads((session_dir / "audit.json").read_text())
+    assert "BUDGET_AUTHORITY_TAMPER" in audit["issues"]
+
+
+def test_controller_audit_detects_the_started_prompt_hash_drifting(tmp_path: Path):
+    """CON-5, CON-7: audit verifies the exact prompt actually used for the session."""
+    from tools import s1_harness_ablation as controller
+
+    campaign, result, runtime = _prepare_controller_campaign(controller, tmp_path)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+    session = json.loads((session_dir / "session.json").read_text())
+    session["run_prompt_sha256"] = "0" * 64
+    (session_dir / "session.json").write_text(json.dumps(session))
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["audit", "--dir", str(session_dir)],
+        runtime,
+    )
+
+    assert returncode == 1
+    assert response["ok"] is False
+    audit = json.loads((session_dir / "audit.json").read_text())
+    assert "PROMPT_DRIFT" in audit["issues"]
+
+
+def test_controller_audit_detects_heldout_exposure_and_local_rollout_bypass(
+    tmp_path: Path,
+):
+    """CON-7: agent-time held-out seeds and local-baseline simulator runs are exclusions."""
+    from tools import s1_harness_ablation as controller
+
+    campaign, result, runtime = _prepare_controller_campaign(controller, tmp_path)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+    leaked_run = session_dir / "worktree" / "runs" / "agent-leak"
+    leaked_run.mkdir(parents=True)
+    (leaked_run / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "agent-leak",
+                "env_baseline": "local",
+                "env_baseline_oid": None,
+            }
+        )
+    )
+    (leaked_run / "episodes.jsonl").write_text(
+        json.dumps({"episode": 0, "seed": 100, "status": "fail"}) + "\n"
+    )
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["audit", "--dir", str(session_dir)],
+        runtime,
+    )
+
+    assert returncode == 1
+    assert response["ok"] is False
+    audit = json.loads((session_dir / "audit.json").read_text())
+    assert {"HELDOUT_EXPOSURE", "UNTRUSTED_ROLLOUT"}.issubset(audit["issues"])
+    assert {"HELDOUT_EXPOSURE", "UNTRUSTED_ROLLOUT"}.issubset(audit["exclusions"])
+
+
+def test_controller_cli_emits_one_json_object_even_for_argument_errors(tmp_path: Path):
+    """CON-8: controller diagnostics never mix usage text into stdout."""
+    from tools import s1_harness_ablation as controller
+
+    runtime = _controller_runtime(controller)
+    returncode, response, output, stderr = _invoke_controller(
+        controller, ["prepare", "--pairs", "1"], runtime
+    )
+
+    assert returncode == 1
+    assert response["ok"] is False
+    assert response["code"] == "ARGUMENT"
+    assert output.count("\n") == 1
+    assert "usage:" not in output
+    assert "usage:" not in stderr
