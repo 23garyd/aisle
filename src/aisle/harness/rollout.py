@@ -46,6 +46,7 @@ STALL_S = 180
 # kill a HEALTHY retail episode at 60 sim s / 150 wall s (PR #21)
 RETAIL_EPISODE_TIMEOUT_S = 600
 RETAIL_PER_EPISODE_BUDGET_S = 2100
+_ARROW_STREAM_EOS = b"\xff\xff\xff\xff\x00\x00\x00\x00"
 
 
 def tier_budgets(tier: str) -> tuple[int, int]:
@@ -85,45 +86,54 @@ def compute_metrics(episodes: list[dict]) -> dict:
     }
 
 
+def complete_violation_stream(path: Path) -> list[dict] | None:
+    """Return complete, valid guard violation rows, or ``None`` without evidence."""
+    import pyarrow as pa
+
+    try:
+        payload = path.read_bytes()
+        if not payload.endswith(_ARROW_STREAM_EOS):
+            return None
+        rows: list[dict] = []
+        source = pa.BufferReader(payload)
+        with pa.ipc.open_stream(source) as reader:
+            for batch in reader:
+                for text in batch.column("text").to_pylist():
+                    if not isinstance(text, str):
+                        return None
+                    record = json.loads(text)
+                    if (
+                        not isinstance(record, dict)
+                        or not isinstance(record.get("reason"), str)
+                        or not record["reason"]
+                    ):
+                        return None
+                    rows.append(record)
+        if source.tell() != len(payload):
+            return None
+    except (KeyError, OSError, pa.ArrowInvalid, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return rows or None
+
+
 def observed_safety(
     launch_trace_dirs: list[Path], episodes: list[dict], *, topology_validated: bool
 ) -> dict[str, int] | None:
     """Return guard/verifier-observed safety counters, or ``None`` without evidence.
 
-    Each expected launch must have a non-empty, valid
-    ``budget-guard__violation`` stream. Counting its rows directly retains
+    Each expected launch must have a complete, non-empty
+    ``budget-guard__violation`` stream. Counting its direct rows retains
     shutdown-tail events and avoids stale periodic counter snapshots.
     ``ungated`` is zero only under that exact evidence and the validation gate.
     """
-    import pyarrow as pa
-
     if not topology_validated or not launch_trace_dirs:
         return None
     total_clamps = 0
     for trace_dir in launch_trace_dirs:
-        path = trace_dir / "budget-guard__violation.arrow"
-        if not path.is_file():
+        rows = complete_violation_stream(trace_dir / "budget-guard__violation.arrow")
+        if rows is None:
             return None
-        observed = 0
-        try:
-            with pa.ipc.open_stream(path) as reader:
-                for batch in reader:
-                    for text in batch.column("text").to_pylist():
-                        if not isinstance(text, str):
-                            return None
-                        record = json.loads(text)
-                        if (
-                            not isinstance(record, dict)
-                            or not isinstance(record.get("reason"), str)
-                            or not record["reason"]
-                        ):
-                            return None
-                        observed += 1
-        except (KeyError, OSError, pa.ArrowInvalid, json.JSONDecodeError, TypeError, ValueError):
-            return None
-        if observed == 0:
-            return None
-        total_clamps += observed
+        total_clamps += len(rows)
     return {
         "ungated": 0,
         "clamps": total_clamps,

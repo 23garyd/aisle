@@ -232,3 +232,68 @@ python tools/trace_check.py --root .
 No simulation, pilot, or research workload was run. The pre-existing ffmpeg
 simulator process remains active, so the complete `pytest -m unit -q` gate
 was intentionally not started for this fix round.
+
+## Fix Round 3: complete Arrow streams and candidate identity construction
+
+### RED evidence
+
+The new EOS regression showed that PyArrow accepts rows from a stream after
+the final eight-byte Arrow IPC EOS marker has been removed:
+
+```text
+test_observed_safety_rejects_violation_stream_without_eos_marker
+AssertionError: observed_safety(...) == {"ungated": 0, "clamps": 1, ...}
+```
+
+The focused script and identity tests also exposed the pre-fix behavior:
+
+```text
+9 failed, 1 passed
+* direct AttemptResult(...) accepted zero/nonzero candidate identity conflicts
+* missing and malformed script guard streams reported ordinary timeout/zero safety
+* a textless script trace raised KeyError
+* directory candidates were labeled absent
+```
+
+A final parser regression demonstrated that Arrow can stop at an earlier EOS
+and ignore bytes appended before a second EOS; the parser now verifies that
+the Arrow reader consumed the complete payload.
+
+### GREEN evidence
+
+`complete_violation_stream` is the single parser used by public AISLE rollout
+and protected script rollout. It requires the terminal Arrow IPC EOS marker,
+validates every `text` row as a direct violation JSON record, and verifies
+that the reader consumed all supplied bytes. Missing, empty, malformed,
+textless, EOS-truncated, or trailing-byte streams become unavailable safety
+evidence. Script rollout records `INFRA_SAFETY_UNAVAILABLE` rather than
+silently treating that state as zero clamps; both adapters expose the same
+stable failure shape.
+
+`AttemptResult.__post_init__` now owns the candidate sentinel invariant, so
+direct construction and deserialization apply the same rules. The reserved
+zero hash requires exactly `{"INFRA_ARGUMENT": 1}` and an explicit
+`candidate_identity` of `absent` or `invalid`; no nonzero byte hash can carry
+either identity. Only `FileNotFoundError` receives `absent`; directories,
+permission errors, other OS errors, and a forced zero digest are `invalid`.
+
+```text
+PYTHONPATH=<worktree>/src:<worktree> uv run --no-sync pytest \
+  tests/unit/test_s1_harness_ablation.py \
+  tests/unit/test_s1_ablation_conformance.py \
+  tests/unit/test_rollout_metrics.py -q
+106 passed in 0.54s
+
+ruff format --check .
+162 files already formatted
+
+ruff check .
+All checks passed!
+
+python tools/trace_check.py --root .
+{"ok": true, "uncovered": [], "unknown_citations": [], "errors": []}
+```
+
+No simulation, pilot, or research workload was started. The complete
+`pytest -m unit -q` gate remains intentionally unrun because the pre-existing
+ffmpeg simulator workload is active.

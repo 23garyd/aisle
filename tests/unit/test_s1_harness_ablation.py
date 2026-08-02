@@ -78,6 +78,33 @@ def test_attempt_result_reserves_zero_hash_for_absent_candidate_refusals_only():
 
 
 @pytest.mark.parametrize(
+    ("candidate_hash", "failures", "artifacts"),
+    [
+        ("0" * 64, {"timeout": 1}, {"candidate_identity": "absent"}),
+        ("0" * 64, {"INFRA_ARGUMENT": 1}, {}),
+        ("a" * 64, {"INFRA_ARGUMENT": 1}, {"candidate_identity": "absent"}),
+    ],
+)
+def test_attempt_result_constructor_enforces_reserved_candidate_identity(
+    candidate_hash: str, failures: dict[str, int], artifacts: dict[str, str]
+):
+    """CON-5: direct attempt construction cannot bypass the reserved hash identity rule."""
+    from aisle.harness.ablation import AttemptResult, PreflightResult, SafetyResult
+
+    with pytest.raises(ValueError, match="candidate"):
+        AttemptResult(
+            attempt_id="A-0001",
+            candidate_hash=candidate_hash,
+            preflight=PreflightResult(ok=False, errors=(), wall_s=0.0),
+            episodes=(),
+            failures=failures,
+            safety=SafetyResult(ungated=0, clamps=0, extra_item=0),
+            timing={"wall_s": 0.0, "sim_s": 0.0},
+            artifacts=artifacts,
+        )
+
+
+@pytest.mark.parametrize(
     ("field", "value", "error"),
     [
         ("candidate_hash", "not-a-sha", "candidate_hash"),
@@ -634,12 +661,37 @@ def test_run_script_rollout_launches_fixed_wrapper_and_returns_attempt_result(
     monkeypatch.setattr(script_rollout, "_terminate_script", lambda proc: None)
     monkeypatch.setattr(script_rollout, "reap_orphans", lambda run_dir: None)
 
+    import pyarrow as pa
+
+    from aisle.harness.trace_recorder import TRACE_SCHEMA
+
+    def launch(graph: Path, run_dir: Path, env: dict, stderr):
+        captured.update(graph=graph, run_dir=run_dir, env=env)
+        Path(env["AISLE_RESULTS"]).write_text(json.dumps(_episode_record(0, 3)) + "\n")
+        traces = run_dir / "traces"
+        with pa.ipc.new_stream(traces / "budget-guard__violation.arrow", TRACE_SCHEMA) as writer:
+            writer.write_batch(
+                pa.record_batch(
+                    [
+                        pa.array([0], pa.int64()),
+                        pa.array([0], pa.int32()),
+                        pa.array([0], pa.int64()),
+                        pa.array([None], pa.list_(pa.float64())),
+                        pa.array(['{"reason":"shutdown_tail"}'], pa.string()),
+                    ],
+                    schema=TRACE_SCHEMA,
+                )
+            )
+        return CompletedGraph()
+
+    monkeypatch.setattr(script_rollout, "_spawn_script_dora", launch)
+
     result = script_rollout.run_script_rollout(policy, "3", "script-unit")
 
     assert result.attempt_id == "script-unit"
     assert result.episodes == (_episode_record(0, 3),)
     assert result.failures == {"timeout": 1}
-    assert result.safety.to_dict() == {"ungated": 0, "clamps": 0, "extra_item": 0}
+    assert result.safety.to_dict() == {"ungated": 0, "clamps": 1, "extra_item": 0}
     assert Path(captured["graph"]).parent == Path(captured["run_dir"])
     env = captured["env"]
     assert env["AISLE_SCRIPT_POLICY"] == str(policy.resolve())
@@ -647,6 +699,108 @@ def test_run_script_rollout_launches_fixed_wrapper_and_returns_attempt_result(
     assert env["AISLE_SEEDS"] == "3"
     assert env["PYTHONPATH"] == f"{tmp_path / 'src'}:{tmp_path}"
     assert "traces_dir" not in result.artifacts
+
+
+@pytest.mark.parametrize("evidence", ["missing", "textless", "malformed", "truncated"])
+def test_run_script_rollout_fails_closed_when_guard_trace_is_incomplete(
+    tmp_path: Path, monkeypatch, evidence: str
+):
+    """CON-5, CON-7: protected script rollouts require the complete guard violation stream."""
+    import pyarrow as pa
+
+    from aisle.harness import script_rollout
+    from aisle.harness.trace_recorder import TRACE_SCHEMA
+
+    (tmp_path / "graphs").mkdir()
+    (tmp_path / "graphs" / "ablation_script_s1_wrapper.yaml").write_text(
+        (REPO_ROOT / "graphs" / "ablation_script_s1_wrapper.yaml").read_text()
+    )
+    policy = tmp_path / "candidate.py"
+    policy.write_text("def create_policy(seed):\n    return object()\n")
+
+    class CompletedGraph:
+        pid = 999_999_999
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+    def launch(graph: Path, run_dir: Path, env: dict, stderr):
+        Path(env["AISLE_RESULTS"]).write_text(json.dumps(_episode_record(0, 3)) + "\n")
+        path = run_dir / "traces" / "budget-guard__violation.arrow"
+        if evidence == "textless":
+            with pa.ipc.new_stream(path, pa.schema([("wrong", pa.string())])) as writer:
+                writer.write_batch(pa.record_batch([pa.array(["ignored"])], names=["wrong"]))
+        elif evidence != "missing":
+            with pa.ipc.new_stream(path, TRACE_SCHEMA) as writer:
+                writer.write_batch(
+                    pa.record_batch(
+                        [
+                            pa.array([0], pa.int64()),
+                            pa.array([0], pa.int32()),
+                            pa.array([0], pa.int64()),
+                            pa.array([None], pa.list_(pa.float64())),
+                            pa.array(['{"reason":"shutdown_tail"}'], pa.string()),
+                        ],
+                        schema=TRACE_SCHEMA,
+                    )
+                )
+            if evidence == "malformed":
+                path.write_bytes(b"not-arrow")
+            elif evidence == "truncated":
+                path.write_bytes(path.read_bytes()[:-8])
+        return CompletedGraph()
+
+    monkeypatch.setattr(script_rollout, "_repository_root", lambda: tmp_path)
+    monkeypatch.setattr(script_rollout, "_spawn_script_dora", launch)
+    monkeypatch.setattr(script_rollout, "_terminate_script", lambda proc: None)
+    monkeypatch.setattr(script_rollout, "reap_orphans", lambda run_dir: None)
+
+    result = script_rollout.run_script_rollout(policy, "3", f"script-{evidence}")
+
+    assert result.failures == {"timeout": 1, "INFRA_SAFETY_UNAVAILABLE": 1}
+
+
+def test_candidate_identity_distinguishes_missing_and_invalid_candidates(
+    tmp_path: Path, monkeypatch
+):
+    """CON-5, CON-8: directories and unreadable candidates never alias a missing file."""
+    from aisle.harness import ablation_adapters
+    from aisle.harness.ablation_adapters import ScriptAdapter
+
+    directory = tmp_path / "candidate-dir"
+    directory.mkdir()
+    assert ScriptAdapter().rollout(directory, "3", "directory").artifacts == {
+        "candidate_identity": "invalid"
+    }
+
+    policy = tmp_path / "candidate.py"
+    policy.write_text("def create_policy(seed):\n    return object()\n")
+    monkeypatch.setattr(
+        ablation_adapters,
+        "sha256_file",
+        lambda path: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+    assert ScriptAdapter().rollout(policy, "3", "unreadable").artifacts == {
+        "candidate_identity": "invalid"
+    }
+
+
+def test_candidate_identity_rejects_reserved_zero_from_a_real_file(tmp_path: Path, monkeypatch):
+    """CON-5: a real candidate hash can never use the missing-input sentinel."""
+    from aisle.harness import ablation_adapters
+    from aisle.harness.ablation_adapters import ScriptAdapter
+
+    policy = tmp_path / "candidate.py"
+    policy.write_text("def create_policy(seed):\n    return object()\n")
+    monkeypatch.setattr(ablation_adapters, "sha256_file", lambda path: "0" * 64)
+
+    result = ScriptAdapter().rollout(policy, "3", "zero-hash")
+
+    assert result.failures == {"INFRA_ARGUMENT": 1}
+    assert result.artifacts == {"candidate_identity": "invalid"}
 
 
 def test_run_script_rollout_refuses_unsafe_run_ids(tmp_path: Path):
@@ -772,7 +926,7 @@ def test_script_adapter_uses_preflight_and_protected_runner_without_harness_vali
         rollout_calls.append((path, seeds, run_id))
         return AttemptResult(
             attempt_id=run_id,
-            candidate_hash="0" * 64,
+            candidate_hash="b" * 64,
             preflight=PreflightResult(ok=True, errors=(), wall_s=0.0),
             episodes=(_episode_record(0, 3),),
             failures={"timeout": 1},
@@ -860,6 +1014,50 @@ def test_aisle_adapter_fails_closed_when_rollout_omits_guard_evidence(tmp_path: 
     result = adapter.rollout(candidate, "3", "A-01")
 
     assert result.failures == {"INFRA_SAFETY_UNAVAILABLE": 1}
+
+
+def test_adapters_normalize_unavailable_guard_evidence_to_the_same_failure(tmp_path: Path):
+    """CON-5, CON-7: both arms expose unavailable guard evidence through one stable failure."""
+    from aisle.harness.ablation import AttemptResult, PreflightResult, SafetyResult
+    from aisle.harness.ablation_adapters import AisleAdapter, ScriptAdapter
+
+    candidate = tmp_path / "candidate.py"
+    candidate.write_text("def create_policy(seed):\n    return object()\n")
+    report = _adapter_rollout_report("A-01")
+    report["safety"] = None
+
+    def aisle_runner(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
+        stdout = '{"ok":true,"errors":[]}'
+        if argv[1] == "rollout":
+            stdout = json.dumps(report)
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    unavailable = AttemptResult(
+        attempt_id="A-01",
+        candidate_hash="b" * 64,
+        preflight=PreflightResult(ok=True, errors=(), wall_s=0.0),
+        episodes=(),
+        failures={"INFRA_SAFETY_UNAVAILABLE": 1},
+        safety=SafetyResult(ungated=0, clamps=0, extra_item=0),
+        timing={"wall_s": 0.0, "sim_s": 0.0},
+        artifacts={},
+    )
+    aisle = AisleAdapter(tmp_path, runner=aisle_runner).rollout(candidate, "3", "A-01")
+    script = ScriptAdapter(
+        preflight_runner=lambda path: PreflightResult(ok=True, errors=(), wall_s=0.0),
+        rollout_runner=lambda path, seeds, run_id: unavailable,
+    ).rollout(candidate, "3", "A-01")
+
+    assert aisle.failures == script.failures == {"INFRA_SAFETY_UNAVAILABLE": 1}
+    assert (
+        aisle.safety.to_dict()
+        == script.safety.to_dict()
+        == {
+            "ungated": 0,
+            "clamps": 0,
+            "extra_item": 0,
+        }
+    )
 
 
 @pytest.mark.parametrize(("seeds", "run_id"), [("bad", "A-01"), ("3", "../escape")])

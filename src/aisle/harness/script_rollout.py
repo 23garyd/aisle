@@ -13,7 +13,7 @@ from pathlib import Path
 
 from aisle.harness.ablation import AttemptResult, PreflightResult, SafetyResult, sha256_file
 from aisle.harness.reaper import reap_orphans
-from aisle.harness.rollout import instrumented_graph, parse_seed_range
+from aisle.harness.rollout import complete_violation_stream, instrumented_graph, parse_seed_range
 
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _GENESIS_BUILD_BUDGET_S = 420
@@ -204,15 +204,15 @@ def _trace_text(path: Path) -> list[str]:
     return rows
 
 
-def _extract_external_diagnostics(run_dir: Path) -> tuple[int, str | None]:
+def _extract_external_diagnostics(run_dir: Path) -> tuple[list[dict] | None, str | None]:
     traces = run_dir / "traces"
-    clamp_count = len(_trace_text(traces / "budget-guard__violation.arrow"))
+    violations = complete_violation_stream(traces / "budget-guard__violation.arrow")
     events = _trace_text(traces / "script-s1-runtime__policy_event.arrow")
     if not events:
-        return clamp_count, None
+        return violations, None
     policy_log = run_dir / "policy_events.jsonl"
     policy_log.write_text("".join(f"{event}\n" for event in events))
-    return clamp_count, str(policy_log.relative_to(_repository_root()))
+    return violations, str(policy_log.relative_to(_repository_root()))
 
 
 def _failure_counts(episodes: list[dict]) -> dict[str, int]:
@@ -298,7 +298,12 @@ def run_script_rollout(policy: Path, seeds: str, run_id: str) -> AttemptResult:
         code = "COMMAND_INVALID" if "COMMAND_INVALID" in runtime_log else "ROLLOUT_INCOMPLETE"
         failures[code] = failures.get(code, 0) + 1
 
-    clamps, policy_log = _extract_external_diagnostics(run_dir)
+    violations, policy_log = _extract_external_diagnostics(run_dir)
+    if violations is None:
+        failures["INFRA_SAFETY_UNAVAILABLE"] = failures.get("INFRA_SAFETY_UNAVAILABLE", 0) + 1
+        clamps = 0
+    else:
+        clamps = len(violations)
     extra_items = sum(
         1
         for episode in episodes

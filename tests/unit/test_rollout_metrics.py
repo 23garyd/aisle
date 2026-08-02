@@ -104,6 +104,32 @@ def test_observed_safety_rejects_malformed_or_textless_violation_stream(tmp_path
     assert observed_safety([trace_dir], [], topology_validated=True) is None
 
 
+def test_observed_safety_rejects_violation_stream_without_eos_marker(tmp_path):
+    """CON-5: complete guard evidence requires Arrow's explicit end-of-stream marker."""
+    from aisle.harness.rollout import observed_safety
+
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    path = trace_dir / "budget-guard__violation.arrow"
+    _write_violation_trace(path, ['{"reason":"shutdown_tail"}'])
+    path.write_bytes(path.read_bytes()[:-8])
+
+    assert observed_safety([trace_dir], [], topology_validated=True) is None
+
+
+def test_observed_safety_rejects_trailing_bytes_after_guard_eos(tmp_path):
+    """CON-5: Arrow must consume the entire stream, not stop at an earlier EOS."""
+    from aisle.harness.rollout import observed_safety
+
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    path = trace_dir / "budget-guard__violation.arrow"
+    _write_violation_trace(path, ['{"reason":"shutdown_tail"}'])
+    path.write_bytes(path.read_bytes() + b"malformed-tail\xff\xff\xff\xff\x00\x00\x00\x00")
+
+    assert observed_safety([trace_dir], [], topology_validated=True) is None
+
+
 def test_observed_safety_counts_all_launch_stream_rows_including_shutdown_tail(tmp_path):
     """CON-5, CON-7: each validated launch contributes each violation once."""
     from aisle.harness.rollout import observed_safety
