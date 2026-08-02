@@ -143,10 +143,17 @@ def prepare_commands(commands: object) -> list[PreparedCommand]:
                 payload, wire_value = _numeric_wire_value(payload, _JOINT_DOF, "joint_cmd")
                 prepared.append(PreparedCommand(kind, payload, wire_value))
             else:
-                if isinstance(payload, dict) and set(payload) == {"action"}:
+                if isinstance(payload, dict) and set(payload) in (
+                    {"action"},
+                    {"action", "product_id"},
+                ):
                     action = payload["action"]
                     if action not in ("open", "close"):
                         raise CommandInvalid("gripper action must be open or close")
+                    if "product_id" in payload and (
+                        not isinstance(payload["product_id"], str) or not payload["product_id"]
+                    ):
+                        raise CommandInvalid("gripper product_id must be a non-empty string")
                     payload = [0.0 if action == "open" else 1.0]
                 normalized, wire_value = _numeric_wire_value(payload, 1, "gripper_cmd")
                 prepared.append(PreparedCommand(kind, normalized, wire_value))

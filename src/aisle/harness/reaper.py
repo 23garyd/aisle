@@ -38,6 +38,7 @@ NODE_PATTERNS = (
     # that misses these leaks spinning processes (the T15 debug lesson:
     # leaked orphans at ~165% CPU starve later runs)
     "nodes/s1_expert.py",
+    "nodes/s1_ablation_driver.py",
     "nodes/order_reader.py",
     "nodes/task_planner.py",
     "nodes/script_s1_runtime.py",

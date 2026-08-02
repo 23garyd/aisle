@@ -46,6 +46,8 @@ EXPECTED_IDS = {
     "s1-expert",
     # Fixed protected runtime for the S1 script ablation
     "script-s1-runtime",
+    # Fixed typed starter driver for the S1 harness ablation (Class C allowlist)
+    "s1-ablation-driver",
 }
 
 

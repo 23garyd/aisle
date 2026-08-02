@@ -23,6 +23,7 @@ core = [
   "pose-estimator",
   "reset",
   "rollout-client",
+  "s1-ablation-driver",
   "s1-expert",
   "script-s1-runtime",
   "stock-detector",
