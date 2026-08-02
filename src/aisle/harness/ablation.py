@@ -239,6 +239,21 @@ class SafetyResult:
         return {"ungated": self.ungated, "clamps": self.clamps, "extra_item": self.extra_item}
 
 
+def normalize_safety_evidence(
+    failures: dict[str, int], safety: dict | None
+) -> tuple[dict[str, int], SafetyResult]:
+    """Preserve a rollout record while failing closed on unavailable safety evidence."""
+    normalized_failures = _count_dict(failures, "failures")
+    if safety is None:
+        normalized_failures["INFRA_SAFETY_UNAVAILABLE"] = (
+            normalized_failures.get("INFRA_SAFETY_UNAVAILABLE", 0) + 1
+        )
+        normalized_safety = SafetyResult(ungated=0, clamps=0, extra_item=0)
+    else:
+        normalized_safety = SafetyResult.from_dict(safety)
+    return normalized_failures, normalized_safety
+
+
 @dataclass(frozen=True)
 class AttemptResult:
     attempt_id: str
@@ -287,6 +302,7 @@ class AttemptResult:
         )
 
     def to_dict(self) -> dict:
+        self.__post_init__()
         return {
             "attempt_id": self.attempt_id,
             "candidate_hash": self.candidate_hash,

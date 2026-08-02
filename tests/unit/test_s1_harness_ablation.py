@@ -104,6 +104,34 @@ def test_attempt_result_constructor_enforces_reserved_candidate_identity(
         )
 
 
+def test_attempt_result_serialization_rejects_mutated_zero_hash_failures():
+    """CON-5: serialization revalidates a sentinel identity after failures mutate."""
+    from aisle.harness.ablation import AttemptResult
+
+    raw = {
+        **_attempt(),
+        "candidate_hash": "0" * 64,
+        "failures": {"INFRA_ARGUMENT": 1},
+        "artifacts": {"candidate_identity": "absent"},
+    }
+    result = AttemptResult.from_dict(raw)
+    result.failures["timeout"] = 1
+
+    with pytest.raises(ValueError, match="reserved"):
+        result.to_dict()
+
+
+def test_attempt_result_serialization_rejects_mutated_nonzero_hash_identity():
+    """CON-5: serialization revalidates a byte hash after artifacts mutate."""
+    from aisle.harness.ablation import AttemptResult
+
+    result = AttemptResult.from_dict(_attempt())
+    result.artifacts["candidate_identity"] = "invalid"
+
+    with pytest.raises(ValueError, match="candidate_identity"):
+        result.to_dict()
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [
@@ -803,6 +831,37 @@ def test_candidate_identity_rejects_reserved_zero_from_a_real_file(tmp_path: Pat
     assert result.artifacts == {"candidate_identity": "invalid"}
 
 
+@pytest.mark.parametrize("resolve_error_type", [PermissionError, OSError, FileNotFoundError])
+def test_adapters_map_candidate_resolution_errors_to_invalid_identity(
+    tmp_path: Path, resolve_error_type: type[OSError]
+):
+    """CON-5, CON-8: resolver failures are invalid input, never an absent-file identity."""
+    from aisle.harness.ablation_adapters import AisleAdapter, ScriptAdapter
+
+    class ResolveFailurePath(type(Path())):
+        def resolve(self, strict: bool = False) -> Path:
+            raise resolve_error_type("candidate resolution failed")
+
+    candidate = ResolveFailurePath(tmp_path / "candidate")
+
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError("invalid candidates must not reach an external runner")
+
+    adapters = (
+        AisleAdapter(tmp_path, runner=unexpected_call),
+        ScriptAdapter(
+            preflight_runner=unexpected_call,
+            rollout_runner=unexpected_call,
+        ),
+    )
+
+    for adapter in adapters:
+        result = adapter.rollout(candidate, "3", "resolve-error")
+        assert result.candidate_hash == "0" * 64
+        assert result.failures == {"INFRA_ARGUMENT": 1}
+        assert result.artifacts == {"candidate_identity": "invalid"}
+
+
 def test_run_script_rollout_refuses_unsafe_run_ids(tmp_path: Path):
     """CON-8: a traversal-shaped script run id cannot escape the external run store."""
     from aisle.harness.script_rollout import run_script_rollout
@@ -1013,51 +1072,87 @@ def test_aisle_adapter_fails_closed_when_rollout_omits_guard_evidence(tmp_path: 
     adapter.preflight(candidate)
     result = adapter.rollout(candidate, "3", "A-01")
 
-    assert result.failures == {"INFRA_SAFETY_UNAVAILABLE": 1}
+    assert result.episodes == (_episode_record(0, 3),)
+    assert result.failures == {"timeout": 1, "INFRA_SAFETY_UNAVAILABLE": 1}
+    assert result.timing == {"wall_s": 1.25, "sim_s": 4.5}
+    assert result.artifacts == {
+        "traces_dir": "runs/unit/traces",
+        "video_0": "runs/unit/traces/overhead.mp4",
+    }
 
 
-def test_adapters_normalize_unavailable_guard_evidence_to_the_same_failure(tmp_path: Path):
-    """CON-5, CON-7: both arms expose unavailable guard evidence through one stable failure."""
-    from aisle.harness.ablation import AttemptResult, PreflightResult, SafetyResult
+def test_adapters_preserve_equivalent_records_when_guard_evidence_is_unavailable(
+    tmp_path: Path, monkeypatch
+):
+    """CON-5, CON-7: real script and CLI paths retain identical unavailable-safety records."""
+    from aisle.harness import script_rollout
+    from aisle.harness.ablation import PreflightResult
     from aisle.harness.ablation_adapters import AisleAdapter, ScriptAdapter
 
-    candidate = tmp_path / "candidate.py"
-    candidate.write_text("def create_policy(seed):\n    return object()\n")
-    report = _adapter_rollout_report("A-01")
-    report["safety"] = None
+    (tmp_path / "graphs").mkdir()
+    (tmp_path / "graphs" / "ablation_script_s1_wrapper.yaml").write_text(
+        (REPO_ROOT / "graphs" / "ablation_script_s1_wrapper.yaml").read_text()
+    )
+    aisle_candidate = tmp_path / "candidate.yaml"
+    aisle_candidate.write_text("nodes: []\n")
+    script_candidate = tmp_path / "candidate.py"
+    script_candidate.write_text("def create_policy(seed):\n    return object()\n")
+    episode = _episode_record(0, 3)
+
+    class CompletedGraph:
+        pid = 999_999_999
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+    def launch(graph: Path, run_dir: Path, env: dict, stderr):
+        Path(env["AISLE_RESULTS"]).write_text(json.dumps(episode) + "\n")
+        return CompletedGraph()
 
     def aisle_runner(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
-        stdout = '{"ok":true,"errors":[]}'
-        if argv[1] == "rollout":
-            stdout = json.dumps(report)
-        return subprocess.CompletedProcess(argv, 0, stdout, "")
+        if argv[1] == "validate":
+            response = {"ok": True, "errors": [], "warnings": []}
+        else:
+            response = {
+                **_adapter_rollout_report("unavailable-parity"),
+                "safety": None,
+                "durations": {"wall_s": 0.0, "sim_s": 4.5},
+            }
+        return subprocess.CompletedProcess(argv, 0, json.dumps(response), "")
 
-    unavailable = AttemptResult(
-        attempt_id="A-01",
-        candidate_hash="b" * 64,
-        preflight=PreflightResult(ok=True, errors=(), wall_s=0.0),
-        episodes=(),
-        failures={"INFRA_SAFETY_UNAVAILABLE": 1},
-        safety=SafetyResult(ungated=0, clamps=0, extra_item=0),
-        timing={"wall_s": 0.0, "sim_s": 0.0},
-        artifacts={},
+    monkeypatch.setattr(script_rollout, "_repository_root", lambda: tmp_path)
+    monkeypatch.setattr(script_rollout, "_spawn_script_dora", launch)
+    monkeypatch.setattr(script_rollout, "_terminate_script", lambda proc: None)
+    monkeypatch.setattr(script_rollout, "reap_orphans", lambda run_dir: None)
+    monkeypatch.setattr(script_rollout.time, "monotonic", lambda: 10.0)
+
+    aisle = AisleAdapter(tmp_path, runner=aisle_runner).rollout(
+        aisle_candidate, "3", "unavailable-parity"
     )
-    aisle = AisleAdapter(tmp_path, runner=aisle_runner).rollout(candidate, "3", "A-01")
     script = ScriptAdapter(
-        preflight_runner=lambda path: PreflightResult(ok=True, errors=(), wall_s=0.0),
-        rollout_runner=lambda path, seeds, run_id: unavailable,
-    ).rollout(candidate, "3", "A-01")
+        preflight_runner=lambda path: PreflightResult(ok=True, errors=(), wall_s=0.0)
+    ).rollout(script_candidate, "3", "unavailable-parity")
 
-    assert aisle.failures == script.failures == {"INFRA_SAFETY_UNAVAILABLE": 1}
+    comparable_fields = ("attempt_id", "preflight", "episodes", "failures", "safety", "timing")
+    aisle_record = aisle.to_dict()
+    script_record = script.to_dict()
     assert (
-        aisle.safety.to_dict()
-        == script.safety.to_dict()
+        {field: aisle_record[field] for field in comparable_fields}
+        == {field: script_record[field] for field in comparable_fields}
         == {
-            "ungated": 0,
-            "clamps": 0,
-            "extra_item": 0,
+            "attempt_id": "unavailable-parity",
+            "preflight": {"ok": True, "errors": [], "wall_s": 0.0},
+            "episodes": [episode],
+            "failures": {"timeout": 1, "INFRA_SAFETY_UNAVAILABLE": 1},
+            "safety": {"ungated": 0, "clamps": 0, "extra_item": 0},
+            "timing": {"wall_s": 0.0, "sim_s": 4.5},
         }
     )
+    assert aisle_record["candidate_hash"] != script_record["candidate_hash"]
+    assert aisle_record["artifacts"] != script_record["artifacts"]
 
 
 @pytest.mark.parametrize(("seeds", "run_id"), [("bad", "A-01"), ("3", "../escape")])

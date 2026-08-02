@@ -297,3 +297,87 @@ python tools/trace_check.py --root .
 No simulation, pilot, or research workload was started. The complete
 `pytest -m unit -q` gate remains intentionally unrun because the pre-existing
 ffmpeg simulator workload is active.
+
+## Fix Round 4: record parity and durable candidate identity
+
+### RED evidence
+
+The new mutation, resolver, and real-runner parity regressions were added
+before production changes:
+
+```text
+env -u PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  UV_PROJECT_ENVIRONMENT=/home/demo/Public/github_aisle/aisle-latest/.venv \
+  PYTHONPATH=<worktree>/src:<worktree> \
+  uv run --no-sync pytest tests/unit/test_s1_harness_ablation.py \
+  -k 'serialization_rejects_mutated or resolution_errors or preserve_equivalent_records' -q
+
+6 failed, 84 deselected in 0.39s
+* both mutation probes serialized invalid candidate identities
+* PermissionError, OSError, and resolver-stage FileNotFoundError escaped
+* AISLE discarded episodes, the existing timeout, sim timing, and artifacts
+```
+
+### GREEN evidence
+
+`normalize_safety_evidence` is now shared by the public adapter normalizer and
+the protected script runner. Unavailable evidence adds the stable
+`INFRA_SAFETY_UNAVAILABLE` count while retaining the rest of the rollout
+record. The parity regression uses `ScriptAdapter`'s real default
+`run_script_rollout` path with only the external dora launch boundary replaced;
+it compares every `AttemptResult` field except the explicitly condition-specific
+candidate hash and artifacts.
+
+`AttemptResult.to_dict()` revalidates the candidate sentinel invariant against
+the current mutable mappings. Candidate resolution and byte hashing are now one
+ordered adapter boundary: every resolver `OSError` is `invalid`, while only a
+`FileNotFoundError` opening the resolved file is `absent`.
+
+```text
+env -u PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  UV_PROJECT_ENVIRONMENT=/home/demo/Public/github_aisle/aisle-latest/.venv \
+  PYTHONPATH=<worktree>/src:<worktree> \
+  uv run --no-sync pytest tests/unit/test_s1_harness_ablation.py \
+  -k 'serialization_rejects_mutated or resolution_errors or preserve_equivalent_records' -q
+
+6 passed, 84 deselected in 0.16s
+
+env -u PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  UV_PROJECT_ENVIRONMENT=/home/demo/Public/github_aisle/aisle-latest/.venv \
+  PYTHONPATH=<worktree>/src:<worktree> \
+  uv run --no-sync pytest tests/unit/test_s1_harness_ablation.py \
+  tests/unit/test_s1_ablation_conformance.py tests/unit/test_rollout_metrics.py -q
+
+111 passed in 0.60s
+
+env -u PYTHONPATH UV_PROJECT_ENVIRONMENT=/home/demo/Public/github_aisle/aisle-latest/.venv \
+  uv run --no-sync ruff format --check .
+162 files already formatted
+
+env -u PYTHONPATH UV_PROJECT_ENVIRONMENT=/home/demo/Public/github_aisle/aisle-latest/.venv \
+  uv run --no-sync ruff check .
+All checks passed!
+
+env -u PYTHONPATH UV_PROJECT_ENVIRONMENT=/home/demo/Public/github_aisle/aisle-latest/.venv \
+  uv run --no-sync python tools/trace_check.py --root .
+exit 0; ok=true, uncovered=[], unknown_citations=[], errors=[]
+
+git diff --check
+exit 0
+```
+
+### Self-review
+
+- The prior handcrafted unavailable-safety parity fake was removed; the
+  regression reaches the protected default runner and retains episodes,
+  failures, safety, timing, and preflight exactly across arms.
+- Resolver-stage `FileNotFoundError` is deliberately `invalid`; the existing
+  real missing-file test still proves the distinct `absent` identity.
+- The complete Arrow parser and missing/textless/malformed/truncated/trailing
+  stream behavior were not modified; the rollout metrics coverage stayed green.
+- Independent read-only review found no Critical, Important, or Minor issues
+  and returned PASS.
+
+No simulation, CUDA, sync, reinstall, pilot, or research workload was started.
+Per the task constraint, verification was limited to the focused
+schema/adapter/rollout tests rather than the broad unit gate.

@@ -11,7 +11,12 @@ import subprocess
 import time
 from pathlib import Path
 
-from aisle.harness.ablation import AttemptResult, PreflightResult, SafetyResult, sha256_file
+from aisle.harness.ablation import (
+    AttemptResult,
+    PreflightResult,
+    normalize_safety_evidence,
+    sha256_file,
+)
 from aisle.harness.reaper import reap_orphans
 from aisle.harness.rollout import complete_violation_stream, instrumented_graph, parse_seed_range
 
@@ -299,16 +304,17 @@ def run_script_rollout(policy: Path, seeds: str, run_id: str) -> AttemptResult:
         failures[code] = failures.get(code, 0) + 1
 
     violations, policy_log = _extract_external_diagnostics(run_dir)
-    if violations is None:
-        failures["INFRA_SAFETY_UNAVAILABLE"] = failures.get("INFRA_SAFETY_UNAVAILABLE", 0) + 1
-        clamps = 0
-    else:
-        clamps = len(violations)
     extra_items = sum(
         1
         for episode in episodes
         if episode.get("failure") == "extra_item" or episode.get("extra_item") is True
     )
+    safety_record = (
+        None
+        if violations is None
+        else {"ungated": 0, "clamps": len(violations), "extra_item": extra_items}
+    )
+    failures, safety = normalize_safety_evidence(failures, safety_record)
     artifacts = {"policy_log": policy_log} if policy_log is not None else {}
     return AttemptResult(
         attempt_id=run_id,
@@ -318,7 +324,7 @@ def run_script_rollout(policy: Path, seeds: str, run_id: str) -> AttemptResult:
         preflight=PreflightResult(ok=True, errors=(), wall_s=0.0),
         episodes=tuple(episodes),
         failures=failures,
-        safety=SafetyResult(ungated=0, clamps=clamps, extra_item=extra_items),
+        safety=safety,
         timing={
             "wall_s": wall_s,
             "sim_s": sum(float(episode.get("t_end", 0.0)) for episode in episodes),

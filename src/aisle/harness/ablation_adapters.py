@@ -10,7 +10,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
-from aisle.harness.ablation import AttemptResult, PreflightResult, SafetyResult, sha256_file
+from aisle.harness.ablation import (
+    AttemptResult,
+    PreflightResult,
+    SafetyResult,
+    normalize_safety_evidence,
+    sha256_file,
+)
 from aisle.harness.rollout import parse_seed_range
 from aisle.harness.script_preflight import preflight_script
 from aisle.harness.script_rollout import run_script_rollout
@@ -121,6 +127,16 @@ def _candidate_hash(candidate: Path) -> tuple[str, str | None]:
     return candidate_hash, None
 
 
+def _resolved_candidate_hash(candidate: Path) -> tuple[Path | None, str, str | None]:
+    """Resolve then hash a candidate without confusing resolver failures with absence."""
+    try:
+        candidate_path = candidate.resolve()
+    except OSError:
+        return None, _ABSENT_CANDIDATE_HASH, "invalid"
+    candidate_hash, candidate_identity = _candidate_hash(candidate_path)
+    return candidate_path, candidate_hash, candidate_identity
+
+
 def _valid_rollout_inputs(seeds: str, run_id: str) -> bool:
     try:
         return bool(parse_seed_range(seeds)) and bool(_RUN_ID.fullmatch(run_id))
@@ -152,8 +168,7 @@ def _normalize_rollout(
     """Translate either arm's rollout report into the single canonical schema."""
     try:
         episodes = response["episodes"]
-        failures = response["failures"]
-        safety = response["safety"]
+        failures, safety = normalize_safety_evidence(response["failures"], response["safety"])
         timing = response.get("durations", response.get("timing"))
         if not isinstance(timing, dict):
             raise ValueError("timing")
@@ -164,7 +179,7 @@ def _normalize_rollout(
                 "preflight": preflight.to_dict(),
                 "episodes": episodes,
                 "failures": failures,
-                "safety": safety,
+                "safety": safety.to_dict(),
                 "timing": timing,
                 "artifacts": _artifacts_from_rollout(response),
             }
@@ -215,8 +230,7 @@ class AisleAdapter:
 
     def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
         started = time.monotonic()
-        candidate_path = self._candidate(candidate)
-        candidate_hash, candidate_identity = _candidate_hash(candidate_path)
+        candidate_path, candidate_hash, candidate_identity = _resolved_candidate_hash(candidate)
         if candidate_identity is not None:
             preflight = PreflightResult(ok=False, errors=({"code": "INFRA_ARGUMENT"},), wall_s=0.0)
             return _attempt_failure(
@@ -227,6 +241,7 @@ class AisleAdapter:
                 started,
                 {"candidate_identity": candidate_identity},
             )
+        assert candidate_path is not None
         cached = self._preflights.get(candidate_path)
         preflight = (
             cached[1]
@@ -268,10 +283,6 @@ class AisleAdapter:
         if code is not None:
             return _attempt_failure(run_id, candidate_hash, preflight, code, started)
         assert response is not None
-        if not isinstance(response.get("safety"), dict):
-            return _attempt_failure(
-                run_id, candidate_hash, preflight, "INFRA_SAFETY_UNAVAILABLE", started
-            )
         try:
             result = _normalize_rollout(response, run_id, candidate_hash, preflight)
         except ValueError:
@@ -327,8 +338,7 @@ class ScriptAdapter:
 
     def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
         started = time.monotonic()
-        candidate_path = self._candidate(candidate)
-        candidate_hash, candidate_identity = _candidate_hash(candidate_path)
+        candidate_path, candidate_hash, candidate_identity = _resolved_candidate_hash(candidate)
         if candidate_identity is not None:
             preflight = PreflightResult(ok=False, errors=({"code": "INFRA_ARGUMENT"},), wall_s=0.0)
             return _attempt_failure(
@@ -339,6 +349,7 @@ class ScriptAdapter:
                 started,
                 {"candidate_identity": candidate_identity},
             )
+        assert candidate_path is not None
         cached = self._preflights.get(candidate_path)
         preflight = (
             cached[1]
