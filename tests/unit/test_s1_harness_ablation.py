@@ -434,6 +434,31 @@ def test_script_runtime_emits_nothing_when_a_later_command_is_invalid():
     assert emitted == []
 
 
+def test_script_runtime_rejects_equality_spoofing_kind_before_any_emission():
+    """BG-1, CON-8: command dispatch accepts only exact built-in string kinds."""
+    from aisle.nodes.script_s1_runtime import CommandInvalid, emit_policy_commands
+    from baselines.script_s1.contract import PolicyCommand
+
+    class SpoofKind:
+        def __eq__(self, other):
+            return True
+
+    command = object.__new__(PolicyCommand)
+    object.__setattr__(command, "kind", SpoofKind())
+    object.__setattr__(command, "payload", {"target": [0.0, 0.0, 0.0]})
+    emitted: list[tuple] = []
+
+    with pytest.raises(CommandInvalid, match="COMMAND_INVALID"):
+        emit_policy_commands(
+            [command],
+            lambda *args: emitted.append(args),
+            {"sim_time_ns": 10, "env_id": 0},
+            nav_seq=0,
+        )
+
+    assert emitted == []
+
+
 def _episode_record(episode: int, seed: int) -> dict:
     return {
         "episode": episode,
@@ -459,6 +484,7 @@ def _episode_record(episode: int, seed: int) -> dict:
         {**_episode_record(0, 3), "status": "ongoing"},
         {**_episode_record(0, 3), "success": True},
         {**_episode_record(0, 3), "t_end": float("nan")},
+        {**_episode_record(0, 3), "t_end": 10**400},
         {**_episode_record(0, 3), "penalties": [1]},
         {**_episode_record(0, 3), "failure": "extra_item"},
         {**_episode_record(0, 3), "penalties": ["invented"]},

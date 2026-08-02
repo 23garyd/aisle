@@ -229,3 +229,60 @@ git diff --check
 
 Per the fix-round instruction, no CUDA smoke was rerun. The earlier single
 live smoke remains the simulator evidence for the unchanged graph topology.
+
+## Fix Round 2
+
+Closed the two remaining review findings:
+
+1. Command dispatch now first requires `type(kind) is str` and membership in
+   the three declared literal command kinds. An attacker-controlled object can
+   no longer reach an equality branch through a spoofed `__eq__`; all
+   rejection happens as `COMMAND_INVALID` while the emission count is still
+   zero. Prepared commands retain only the validated built-in string, deep
+   normalized payload, and final Arrow value. Policy-event JSON is likewise
+   serialized with `allow_nan=False` before the first send.
+2. Episode numeric conversion is now total and fail-closed. Numeric
+   conversion catches `OverflowError`, `TypeError`, and `ValueError`; JSON
+   decoding and record validation also classify those failures as malformed.
+   An oversized integer therefore yields `RESULT_INVALID` behavior and cannot
+   complete an episode.
+
+### RED evidence
+
+```text
+env -u PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  UV_PROJECT_ENVIRONMENT=/home/demo/Public/github_aisle/aisle-latest/.venv \
+  uv run --no-sync pytest tests/unit/test_s1_harness_ablation.py \
+  -k 'equality_spoofing or malformed_episode_records' -q
+2 failed, 15 passed, 46 deselected
+```
+
+The equality-spoofing kind emitted without raising, and the oversized integer
+escaped `_episode_record_is_valid` as `OverflowError`.
+
+### GREEN evidence
+
+```text
+env -u PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  UV_PROJECT_ENVIRONMENT=/home/demo/Public/github_aisle/aisle-latest/.venv \
+  uv run --no-sync pytest tests/unit/test_s1_harness_ablation.py \
+  -k 'equality_spoofing or malformed_episode_records' -q
+17 passed, 46 deselected in 0.16s
+
+env -u PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  UV_PROJECT_ENVIRONMENT=/home/demo/Public/github_aisle/aisle-latest/.venv \
+  uv run --no-sync pytest tests/unit/test_s1_harness_ablation.py -q
+63 passed in 0.30s
+
+uv run --no-sync ruff format --check .
+154 files already formatted
+uv run --no-sync ruff check .
+All checks passed
+python tools/trace_check.py --root .
+{"ok": true, "uncovered": [], "unknown_citations": [], "errors": []}
+git diff --check
+(clean)
+```
+
+No CUDA workload, dependency synchronization, or environment reinstall was
+performed in this fix round.

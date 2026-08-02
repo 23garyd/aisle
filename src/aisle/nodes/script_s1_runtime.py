@@ -32,6 +32,7 @@ PolicyEvent = _contract.PolicyEvent
 _JSON_INPUTS = frozenset({"episode_goal", "nav_result"})
 _NUMERIC_INPUTS = frozenset({"poses", "joint_state", "base_pose", "reset_done"})
 _INPUTS = _JSON_INPUTS | _NUMERIC_INPUTS
+_COMMAND_KINDS = frozenset({"nav_goal", "joint_cmd", "gripper_cmd"})
 _JOINT_DOF = 9
 
 
@@ -123,33 +124,32 @@ def prepare_commands(commands: object) -> list[PreparedCommand]:
         for command in commands:
             if not isinstance(command, PolicyCommand):
                 raise CommandInvalid("every result must be a PolicyCommand")
-            if command.kind == "nav_goal":
-                if not isinstance(command.payload, dict) or not _json_value_is_valid(
-                    command.payload
-                ):
+            kind = command.kind
+            if type(kind) is not str or kind not in _COMMAND_KINDS:
+                raise CommandInvalid("command kind must be nav_goal, joint_cmd, or gripper_cmd")
+            payload = command.payload
+            if kind == "nav_goal":
+                if not isinstance(payload, dict) or not _json_value_is_valid(payload):
                     raise CommandInvalid("nav_goal payload must be a JSON-compatible dict")
                 serialized = json.dumps(
-                    command.payload,
+                    payload,
                     allow_nan=False,
                     sort_keys=True,
                     separators=(",", ":"),
                 )
                 payload = json.loads(serialized)
-                prepared.append(PreparedCommand(command.kind, payload, pa.array([serialized])))
-            elif command.kind == "joint_cmd":
-                payload, wire_value = _numeric_wire_value(command.payload, _JOINT_DOF, "joint_cmd")
-                prepared.append(PreparedCommand(command.kind, payload, wire_value))
-            elif command.kind == "gripper_cmd":
-                payload = command.payload
+                prepared.append(PreparedCommand(kind, payload, pa.array([serialized])))
+            elif kind == "joint_cmd":
+                payload, wire_value = _numeric_wire_value(payload, _JOINT_DOF, "joint_cmd")
+                prepared.append(PreparedCommand(kind, payload, wire_value))
+            else:
                 if isinstance(payload, dict) and set(payload) == {"action"}:
                     action = payload["action"]
                     if action not in ("open", "close"):
                         raise CommandInvalid("gripper action must be open or close")
                     payload = [0.0 if action == "open" else 1.0]
                 normalized, wire_value = _numeric_wire_value(payload, 1, "gripper_cmd")
-                prepared.append(PreparedCommand(command.kind, normalized, wire_value))
-            else:  # defensive if a forged object bypasses PolicyCommand.__post_init__
-                raise CommandInvalid(f"undeclared command kind {command.kind!r}")
+                prepared.append(PreparedCommand(kind, normalized, wire_value))
         return prepared
     except CommandInvalid:
         raise
@@ -247,7 +247,14 @@ def main() -> None:
                 "sim_time_ns": event.sim_time_ns,
             }
             event_wire_value = pa.array(
-                [json.dumps(event_record, sort_keys=True, separators=(",", ":"))]
+                [
+                    json.dumps(
+                        event_record,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                ]
             )
             commands = prepare_commands(_call_policy(policy, event))
             send("policy_event", event_wire_value, output_meta)

@@ -99,6 +99,16 @@ def _placement_score_is_valid(score: object) -> bool:
     )
 
 
+def _finite_nonnegative_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number >= 0
+
+
 def _episode_record_is_valid(record: object, episode: int, seed: int) -> bool:
     if not isinstance(record, dict) or not _EPISODE_REQUIRED <= set(record):
         return False
@@ -125,13 +135,7 @@ def _episode_record_is_valid(record: object, episode: int, seed: int) -> bool:
         return False
     if status == "fail" and (not isinstance(failure, str) or not failure):
         return False
-    t_end = record["t_end"]
-    if (
-        isinstance(t_end, bool)
-        or not isinstance(t_end, (int, float))
-        or not math.isfinite(float(t_end))
-        or t_end < 0
-    ):
+    if not _finite_nonnegative_number(record["t_end"]):
         return False
     penalties = record["penalties"]
     if not isinstance(penalties, list) or not all(
@@ -164,13 +168,17 @@ def _read_episode_results(path: Path, expected_seeds: list[int]) -> tuple[list[d
             continue
         try:
             record = json.loads(line)
-        except json.JSONDecodeError:
+        except (OverflowError, TypeError, ValueError):
             malformed += 1
             continue
         expected_episode = len(records)
-        if expected_episode >= len(expected_seeds) or not _episode_record_is_valid(
-            record, expected_episode, expected_seeds[expected_episode]
-        ):
+        try:
+            valid = expected_episode < len(expected_seeds) and _episode_record_is_valid(
+                record, expected_episode, expected_seeds[expected_episode]
+            )
+        except (OverflowError, TypeError, ValueError):
+            valid = False
+        if not valid:
             malformed += 1
             continue
         records.append(record)
