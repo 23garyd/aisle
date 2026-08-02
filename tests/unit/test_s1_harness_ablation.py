@@ -124,3 +124,68 @@ def test_ledger_invalid_utf8_tampering_returns_invalid_result(tmp_path: Path):
     path.write_bytes(b"\xff")
 
     assert verify_ledger(path) == (False, None)
+
+
+@pytest.mark.parametrize(
+    ("source", "code"),
+    [
+        ("def create_policy(:\n", "SCRIPT_SYNTAX"),
+        ("import does_not_exist\n", "SCRIPT_IMPORT"),
+        ("VALUE = 1\n", "FACTORY_MISSING"),
+        ("def create_policy(seed):\n    return object()\n", "POLICY_INVALID"),
+        (
+            "from baselines.script_s1.contract import PolicyCommand\n"
+            "class Policy:\n"
+            "    def on_event(self, event):\n"
+            "        return [PolicyCommand('bad_command', {})]\n"
+            "def create_policy(seed):\n"
+            "    return Policy()\n",
+            "COMMAND_INVALID",
+        ),
+    ],
+)
+def test_script_preflight_returns_stable_failure_codes(tmp_path: Path, source: str, code: str):
+    """HAR-1, CON-8: invalid script candidates fail before any runtime launch."""
+    from aisle.harness.script_preflight import preflight_script
+
+    path = tmp_path / "candidate.py"
+    path.write_text(source)
+
+    result = preflight_script(path)
+
+    assert result.ok is False
+    assert result.errors == ({"code": code},)
+    assert result.wall_s >= 0.0
+
+
+def test_script_preflight_accepts_a_valid_policy(tmp_path: Path):
+    """HAR-1, CON-8: a policy with a valid synthetic-goal command passes preflight."""
+    from aisle.harness.script_preflight import preflight_script
+
+    path = tmp_path / "candidate.py"
+    path.write_text(
+        "from baselines.script_s1.contract import PolicyCommand\n"
+        "class Policy:\n"
+        "    def on_event(self, event):\n"
+        "        if event.kind == 'episode_goal':\n"
+        "            return [PolicyCommand('nav_goal', {'target': [0.0, 1.0]})]\n"
+        "        return []\n"
+        "def create_policy(seed):\n"
+        "    return Policy()\n"
+    )
+
+    result = preflight_script(path)
+
+    assert result.ok is True
+    assert result.errors == ()
+    assert result.wall_s >= 0.0
+
+
+def test_script_preflight_accepts_the_editable_starter():
+    """HAR-1, CON-8: the shipped starter obeys the isolated policy contract."""
+    from aisle.harness.script_preflight import preflight_script
+
+    result = preflight_script(Path("baselines/script_s1/starter.py"))
+
+    assert result.ok is True
+    assert result.errors == ()
