@@ -821,7 +821,7 @@ def test_aisle_adapter_fails_closed_when_rollout_omits_guard_evidence(tmp_path: 
     candidate = tmp_path / "candidate.yaml"
     candidate.write_text("nodes: []\n")
     report = _adapter_rollout_report("A-01")
-    del report["safety"]
+    report["safety"] = None
 
     def run(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
         stdout = '{"ok":true,"errors":[],"warnings":[]}\n'
@@ -834,3 +834,54 @@ def test_aisle_adapter_fails_closed_when_rollout_omits_guard_evidence(tmp_path: 
     result = adapter.rollout(candidate, "3", "A-01")
 
     assert result.failures == {"INFRA_SAFETY_UNAVAILABLE": 1}
+
+
+@pytest.mark.parametrize(("seeds", "run_id"), [("bad", "A-01"), ("3", "../escape")])
+def test_script_adapter_maps_invalid_rollout_arguments_without_launching_runner(
+    tmp_path: Path, seeds: str, run_id: str
+):
+    """CON-8: script and AISLE adapters return stable INFRA_ARGUMENT records for invalid input."""
+    from aisle.harness.ablation import PreflightResult
+    from aisle.harness.ablation_adapters import ScriptAdapter
+
+    candidate = tmp_path / "candidate.py"
+    candidate.write_text("def create_policy(seed):\n    return object()\n")
+    launches: list[tuple[Path, str, str]] = []
+    adapter = ScriptAdapter(
+        preflight_runner=lambda path: PreflightResult(ok=True, errors=(), wall_s=0.1),
+        rollout_runner=lambda path, requested_seeds, requested_run_id: launches.append(
+            (path, requested_seeds, requested_run_id)
+        ),
+    )
+
+    result = adapter.rollout(candidate, seeds, run_id)
+
+    assert result.failures == {"INFRA_ARGUMENT": 1}
+    assert launches == []
+
+
+def test_script_adapter_maps_missing_candidate_to_stable_argument_failure(tmp_path: Path):
+    """CON-8: an absent script policy cannot escape as FileNotFoundError."""
+    from aisle.harness.ablation_adapters import ScriptAdapter
+
+    candidate = tmp_path / "missing.py"
+    result = ScriptAdapter().rollout(candidate, "3", "A-01")
+
+    assert result.failures == {"INFRA_ARGUMENT": 1}
+    assert len(result.candidate_hash) == 64
+
+
+def test_script_adapter_preflight_failure_measures_elapsed_wall_time(tmp_path: Path):
+    """CON-5, CON-8: script preflight failures use the measured wall-time record."""
+    from aisle.harness.ablation_adapters import ScriptAdapter
+
+    candidate = tmp_path / "candidate.py"
+    candidate.write_text("def create_policy(seed):\n    return object()\n")
+    ticks = iter((10.0, 10.75))
+
+    def timeout(path: Path):
+        raise subprocess.TimeoutExpired(["preflight"], 10)
+
+    result = ScriptAdapter(preflight_runner=timeout, clock=lambda: next(ticks)).preflight(candidate)
+
+    assert result.to_dict() == {"ok": False, "errors": [{"code": "INFRA_TIMEOUT"}], "wall_s": 0.75}

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import subprocess
 import time
 from collections.abc import Callable
@@ -18,6 +20,7 @@ _COMMAND_TIMEOUT_S = 30.0
 _GENESIS_BUILD_BUDGET_S = 420.0
 _S1_EPISODE_BUDGET_S = 2100.0
 _ZERO_SAFETY = SafetyResult(ungated=0, clamps=0, extra_item=0)
+_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 CommandRunner = Callable[[list[str], float], subprocess.CompletedProcess[str]]
 ScriptPreflightRunner = Callable[[Path], PreflightResult]
@@ -100,6 +103,21 @@ def _attempt_failure(
     )
 
 
+def _candidate_hash(candidate: Path) -> tuple[str, bool]:
+    """Return a byte hash, or a deterministic missing-input identity for refusals."""
+    try:
+        return sha256_file(candidate), True
+    except OSError:
+        return hashlib.sha256(f"missing-candidate:{candidate}".encode()).hexdigest(), False
+
+
+def _valid_rollout_inputs(seeds: str, run_id: str) -> bool:
+    try:
+        return bool(parse_seed_range(seeds)) and bool(_RUN_ID.fullmatch(run_id))
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _artifacts_from_rollout(response: dict) -> dict[str, str]:
     raw = response.get("artifacts")
     if raw is not None:
@@ -125,7 +143,7 @@ def _normalize_rollout(
     try:
         episodes = response["episodes"]
         failures = response["failures"]
-        safety = response.get("safety", _ZERO_SAFETY.to_dict())
+        safety = response["safety"]
         timing = response.get("durations", response.get("timing"))
         if not isinstance(timing, dict):
             raise ValueError("timing")
@@ -188,7 +206,10 @@ class AisleAdapter:
     def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
         started = time.monotonic()
         candidate_path = self._candidate(candidate)
-        candidate_hash = sha256_file(candidate_path)
+        candidate_hash, candidate_exists = _candidate_hash(candidate_path)
+        if not candidate_exists:
+            preflight = PreflightResult(ok=False, errors=({"code": "INFRA_ARGUMENT"},), wall_s=0.0)
+            return _attempt_failure(run_id, candidate_hash, preflight, "INFRA_ARGUMENT", started)
         cached = self._preflights.get(candidate_path)
         preflight = (
             cached[1]
@@ -197,10 +218,9 @@ class AisleAdapter:
         )
         if not preflight.ok:
             return _attempt_failure(run_id, candidate_hash, preflight, "PREFLIGHT_FAILED", started)
-        try:
-            episode_count = len(parse_seed_range(seeds))
-        except ValueError:
+        if not _valid_rollout_inputs(seeds, run_id):
             return _attempt_failure(run_id, candidate_hash, preflight, "INFRA_ARGUMENT", started)
+        episode_count = len(parse_seed_range(seeds))
         response, code = _command_response(
             self._runner,
             [
@@ -231,7 +251,7 @@ class AisleAdapter:
         if code is not None:
             return _attempt_failure(run_id, candidate_hash, preflight, code, started)
         assert response is not None
-        if "safety" not in response:
+        if not isinstance(response.get("safety"), dict):
             return _attempt_failure(
                 run_id, candidate_hash, preflight, "INFRA_SAFETY_UNAVAILABLE", started
             )
@@ -254,9 +274,11 @@ class ScriptAdapter:
         *,
         preflight_runner: ScriptPreflightRunner = preflight_script,
         rollout_runner: ScriptRolloutRunner = run_script_rollout,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._preflight_runner = preflight_runner
         self._rollout_runner = rollout_runner
+        self._clock = clock
         self._policy_logs: dict[Path, str] = {}
         self._preflights: dict[Path, tuple[str, PreflightResult]] = {}
 
@@ -265,12 +287,21 @@ class ScriptAdapter:
 
     def preflight(self, candidate: Path) -> PreflightResult:
         candidate_path = self._candidate(candidate)
+        started = self._clock()
         try:
             result = self._preflight_runner(candidate_path)
         except subprocess.TimeoutExpired:
-            result = PreflightResult(ok=False, errors=({"code": "INFRA_TIMEOUT"},), wall_s=0.0)
+            result = PreflightResult(
+                ok=False,
+                errors=({"code": "INFRA_TIMEOUT"},),
+                wall_s=self._clock() - started,
+            )
         except OSError:
-            result = PreflightResult(ok=False, errors=({"code": "INFRA_LAUNCH"},), wall_s=0.0)
+            result = PreflightResult(
+                ok=False,
+                errors=({"code": "INFRA_LAUNCH"},),
+                wall_s=self._clock() - started,
+            )
         try:
             self._preflights[candidate_path] = (sha256_file(candidate_path), result)
         except OSError:
@@ -280,7 +311,10 @@ class ScriptAdapter:
     def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
         started = time.monotonic()
         candidate_path = self._candidate(candidate)
-        candidate_hash = sha256_file(candidate_path)
+        candidate_hash, candidate_exists = _candidate_hash(candidate_path)
+        if not candidate_exists:
+            preflight = PreflightResult(ok=False, errors=({"code": "INFRA_ARGUMENT"},), wall_s=0.0)
+            return _attempt_failure(run_id, candidate_hash, preflight, "INFRA_ARGUMENT", started)
         cached = self._preflights.get(candidate_path)
         preflight = (
             cached[1]
@@ -289,12 +323,16 @@ class ScriptAdapter:
         )
         if not preflight.ok:
             return _attempt_failure(run_id, candidate_hash, preflight, "PREFLIGHT_FAILED", started)
+        if not _valid_rollout_inputs(seeds, run_id):
+            return _attempt_failure(run_id, candidate_hash, preflight, "INFRA_ARGUMENT", started)
         try:
             raw = self._rollout_runner(candidate_path, seeds, run_id)
         except subprocess.TimeoutExpired:
             return _attempt_failure(run_id, candidate_hash, preflight, "INFRA_TIMEOUT", started)
         except OSError:
             return _attempt_failure(run_id, candidate_hash, preflight, "INFRA_LAUNCH", started)
+        except ValueError:
+            return _attempt_failure(run_id, candidate_hash, preflight, "INFRA_ARGUMENT", started)
         try:
             result = _normalize_rollout(raw.to_dict(), run_id, candidate_hash, preflight)
         except (AttributeError, ValueError):

@@ -85,6 +85,56 @@ def compute_metrics(episodes: list[dict]) -> dict:
     }
 
 
+def observed_safety(traces_dir: Path, episodes: list[dict]) -> dict[str, int] | None:
+    """Return guard/verifier-observed safety counters, or ``None`` without evidence.
+
+    A completed ``budget-guard__guard_stats`` trace is the evidence that the
+    validated graph's mandatory guard ran. Each file records cumulative counts
+    for one dora launch, so relaunch files contribute their final record only.
+    ``ungated`` is zero only under that joint trace-and-validation evidence;
+    an absent or malformed guard trace must never become an inferred zero.
+    """
+    import pyarrow as pa
+
+    total_clamps = 0
+    paths = sorted(traces_dir.rglob("budget-guard__guard_stats.arrow"))
+    if not paths:
+        return None
+    for path in paths:
+        final_counts: dict[str, int] | None = None
+        try:
+            with pa.ipc.open_stream(path) as reader:
+                for batch in reader:
+                    for text in batch.column("text").to_pylist():
+                        if text is None:
+                            continue
+                        record = json.loads(text)
+                        counts = record.get("violations") if isinstance(record, dict) else None
+                        if not isinstance(counts, dict) or not all(
+                            isinstance(reason, str)
+                            and not isinstance(count, bool)
+                            and isinstance(count, int)
+                            and count >= 0
+                            for reason, count in counts.items()
+                        ):
+                            return None
+                        final_counts = counts
+        except (OSError, pa.ArrowInvalid, json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if final_counts is None:
+            return None
+        total_clamps += sum(final_counts.values())
+    return {
+        "ungated": 0,
+        "clamps": total_clamps,
+        "extra_item": sum(
+            1
+            for episode in episodes
+            if episode.get("failure") == "extra_item" or episode.get("extra_item") is True
+        ),
+    }
+
+
 def load_campaign_budget(root: Path) -> dict:
     """ADR-21: the campaign ceilings from harness/budget.toml (FROZEN — a
     research agent must not raise its own budget)."""
@@ -656,6 +706,7 @@ def rollout(
         env_attested = False
     wall_s = time.monotonic() - started
     metrics = compute_metrics(episode_records)
+    safety = observed_safety(traces_dir, episode_records)
     videos = sorted(str(p.relative_to(root)) for p in traces_dir.rglob("*.mp4"))
     manifest = {
         "run_id": run_id,
@@ -697,6 +748,7 @@ def rollout(
         "run_id": run_id,
         **metrics,
         "episodes": episode_records,
+        "safety": safety,
         "traces_dir": str(traces_dir.relative_to(root)),
         "videos": videos,
         "durations": {

@@ -110,3 +110,72 @@ python tools/trace_check.py --root .
 - Invalid CLI output, timeout, launch failure, invalid seed syntax, missing
   safety evidence, and malformed normalized payloads fail closed.
 - The script deliverable boundary excludes raw trace paths.
+
+## Fix Round 1 — usable public safety records and adapter parity
+
+### RED evidence
+
+New focused tests were added before the integration change. They produced the
+following expected failures:
+
+```text
+test_script_adapter_maps_invalid_rollout_arguments_without_launching_runner
+2 failed: {'INFRA_PROTOCOL': 1} != {'INFRA_ARGUMENT': 1}
+
+test_script_adapter_maps_missing_candidate_to_stable_argument_failure
+FileNotFoundError from sha256_file(missing.py)
+
+test_script_adapter_preflight_failure_measures_elapsed_wall_time
+TypeError: ScriptAdapter.__init__() got an unexpected keyword argument 'clock'
+
+test_rollout_exports_observed_guard_stats_and_extra_item_safety
+KeyError: 'safety'
+```
+
+The initial rollout test invocation used the shared editable parent checkout
+and therefore continued to report the old missing key after implementation.
+The worktree-pinned rerun below is the authoritative result.
+
+### GREEN evidence
+
+`rollout.observed_safety` reads the final cumulative `violations` object from
+each recorded `budget-guard__guard_stats.arrow` stream, sums its observed
+counts across relaunches, and derives `extra_item` from episode outcomes. A
+guard-stats trace is mandatory: absent, malformed, or empty evidence yields
+`"safety": null`; `AisleAdapter` maps that to
+`INFRA_SAFETY_UNAVAILABLE`. Thus no zero clamp or ungated count is reported
+without the validated topology plus an observed guard counter stream.
+
+The script adapter now validates seed syntax and run IDs before its protected
+runner, maps runner `ValueError` and missing policy input to `INFRA_ARGUMENT`,
+and uses an injected monotonic clock to measure timeout/launch-preflight
+wall time. A missing file has no byte hash; its refusal record uses a
+deterministic domain-separated missing-candidate identity hash solely to meet
+the immutable result schema while clearly carrying `INFRA_ARGUMENT`.
+
+```text
+PYTHONPATH=<worktree>/src:<worktree> uv run --no-sync pytest \
+  tests/unit/test_s1_harness_ablation.py \
+  tests/unit/test_rollout_metrics.py -q
+84 passed in 0.50s
+
+ruff format --check src/aisle/harness/rollout.py \
+  src/aisle/harness/ablation_adapters.py \
+  tests/unit/test_rollout_metrics.py tests/unit/test_s1_harness_ablation.py
+4 files already formatted
+
+ruff check <same four files>
+All checks passed!
+
+ruff format --check . && ruff check .
+162 files already formatted
+All checks passed!
+
+python tools/trace_check.py --root .
+{"ok": true, "uncovered": [], "unknown_citations": [], "errors": []}
+```
+
+The full `pytest -m unit -q` gate was not rerun: the same pre-existing ffmpeg
+simulator workload recorded above remains active, and the task prohibits new
+simulation runs. No simulator, pilot, or research workload was started for
+this fix round.

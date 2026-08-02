@@ -51,6 +51,78 @@ def test_seed_range_forms():
     assert parse_seed_range("1,4,9") == [1, 4, 9]
 
 
+def test_rollout_exports_observed_guard_stats_and_extra_item_safety(tmp_path, monkeypatch):
+    """HAR-1, CON-5, CON-7: public rollout exports measured guard/episode safety evidence."""
+    import pyarrow as pa
+
+    from aisle.harness import rollout as ro
+    from aisle.harness.trace_recorder import TRACE_SCHEMA
+
+    root = tmp_path / "proj"
+    (root / "graphs").mkdir(parents=True)
+    (root / "graphs" / "g.yaml").write_text(
+        "nodes:\n- id: budget-guard\n  path: guard.py\n  outputs: [guard_stats]\n"
+    )
+    (root / "harness").mkdir()
+    (root / "harness" / "budget.toml").write_text(
+        "[campaign]\ntokens = 1\nepisodes = 1\nwall_h = 1\n"
+    )
+
+    class Done:
+        pid = 2**22
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def spawn(graph: Path, run_dir: Path, env: dict):
+        document = yaml.safe_load(graph.read_text())
+        recorder = next(node for node in document["nodes"] if node["id"] == "trace-recorder")
+        trace_dir = Path(recorder["env"]["AISLE_TRACE_DIR"])
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        with pa.ipc.new_stream(
+            trace_dir / "budget-guard__guard_stats.arrow", TRACE_SCHEMA
+        ) as writer:
+            writer.write_batch(
+                pa.record_batch(
+                    [
+                        pa.array([0], pa.int64()),
+                        pa.array([0], pa.int32()),
+                        pa.array([1], pa.int64()),
+                        pa.array([None], pa.list_(pa.float64())),
+                        pa.array(['{"violations":{"position":2,"velocity":1}}'], pa.string()),
+                    ],
+                    schema=TRACE_SCHEMA,
+                )
+            )
+        Path(env["AISLE_RESULTS"]).write_text(
+            '{"episode":0,"seed":3,"status":"fail","failure":"extra_item","success":false}\n'
+        )
+        return Done()
+
+    monkeypatch.setattr(ro, "_spawn_dora", spawn)
+    monkeypatch.setattr(ro, "run_gates", lambda *args, **kwargs: {"ok": True, "env_hash": "x"})
+    monkeypatch.setattr(ro, "reap_orphans", lambda *args, **kwargs: None)
+
+    report = ro.rollout(
+        root=root,
+        graph=root / "graphs" / "g.yaml",
+        tier="S1",
+        episodes=1,
+        seeds=[3],
+        reset_mode="teleport",
+        verifier="oracle",
+        run_id="safety",
+        branch="test",
+        no_idea_gate=True,
+        env_baseline="local",
+    )
+
+    assert report["safety"] == {"ungated": 0, "clamps": 3, "extra_item": 1}
+
+
 def test_instrumented_graph_adds_recorder_and_absolutizes(tmp_path):
     """HAR-4: the executable copy gains a trace-recorder wired to every
     traceable topic that exists in the graph, node paths are absolute
