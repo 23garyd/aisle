@@ -179,3 +179,56 @@ The full `pytest -m unit -q` gate was not rerun: the same pre-existing ffmpeg
 simulator workload recorded above remains active, and the task prohibits new
 simulation runs. No simulator, pilot, or research workload was started for
 this fix round.
+
+## Fix Round 2: complete launch evidence and absent candidate identity
+
+### RED evidence
+
+Before implementation, the new focused tests failed as intended:
+
+```text
+tests/unit/test_rollout_metrics.py -k 'observed_safety or rollout_exports'
+4 failed
+TypeError: observed_safety() got an unexpected keyword argument 'topology_validated'
+AssertionError: report["safety"] was None
+
+tests/unit/test_s1_harness_ablation.py -k 'reserves_zero_hash or maps_missing_candidate'
+2 failed
+```
+
+### GREEN evidence
+
+`rollout.observed_safety` now receives the explicit list of initial-launch
+and relaunch trace directories. It requires every expected directory to
+contain a non-empty, readable `budget-guard__violation.arrow` stream with a
+`text` column and valid violation JSON. It counts every row once, including
+the final shutdown-tail row, and returns unavailable evidence for a missing,
+empty, malformed, or textless stream. `ungated: 0` is emitted only when that
+complete evidence is present and topology validation was supplied.
+
+The all-zero SHA-256 value is reserved in `AttemptResult.from_dict` for an
+absent candidate only: it requires `failures == {"INFRA_ARGUMENT": 1}` and
+`artifacts["candidate_identity"] == "absent"` (additional artifact fields
+remain permitted). Conversely, a nonzero byte hash cannot carry that absent
+identity. Both adapters produce that form only for a missing candidate;
+ordinary real files continue to use their SHA-256 byte hash.
+
+```text
+PYTHONPATH=<worktree>/src:<worktree> uv run --no-sync pytest \
+  tests/unit/test_s1_harness_ablation.py \
+  tests/unit/test_rollout_metrics.py -q
+88 passed in 0.57s
+
+ruff format --check .
+162 files already formatted
+
+ruff check .
+All checks passed!
+
+python tools/trace_check.py --root .
+{"ok": true, "uncovered": [], "unknown_citations": [], "errors": []}
+```
+
+No simulation, pilot, or research workload was run. The pre-existing ffmpeg
+simulator process remains active, so the complete `pytest -m unit -q` gate
+was intentionally not started for this fix round.

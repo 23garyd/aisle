@@ -85,45 +85,45 @@ def compute_metrics(episodes: list[dict]) -> dict:
     }
 
 
-def observed_safety(traces_dir: Path, episodes: list[dict]) -> dict[str, int] | None:
+def observed_safety(
+    launch_trace_dirs: list[Path], episodes: list[dict], *, topology_validated: bool
+) -> dict[str, int] | None:
     """Return guard/verifier-observed safety counters, or ``None`` without evidence.
 
-    A completed ``budget-guard__guard_stats`` trace is the evidence that the
-    validated graph's mandatory guard ran. Each file records cumulative counts
-    for one dora launch, so relaunch files contribute their final record only.
-    ``ungated`` is zero only under that joint trace-and-validation evidence;
-    an absent or malformed guard trace must never become an inferred zero.
+    Each expected launch must have a non-empty, valid
+    ``budget-guard__violation`` stream. Counting its rows directly retains
+    shutdown-tail events and avoids stale periodic counter snapshots.
+    ``ungated`` is zero only under that exact evidence and the validation gate.
     """
     import pyarrow as pa
 
-    total_clamps = 0
-    paths = sorted(traces_dir.rglob("budget-guard__guard_stats.arrow"))
-    if not paths:
+    if not topology_validated or not launch_trace_dirs:
         return None
-    for path in paths:
-        final_counts: dict[str, int] | None = None
+    total_clamps = 0
+    for trace_dir in launch_trace_dirs:
+        path = trace_dir / "budget-guard__violation.arrow"
+        if not path.is_file():
+            return None
+        observed = 0
         try:
             with pa.ipc.open_stream(path) as reader:
                 for batch in reader:
                     for text in batch.column("text").to_pylist():
-                        if text is None:
-                            continue
+                        if not isinstance(text, str):
+                            return None
                         record = json.loads(text)
-                        counts = record.get("violations") if isinstance(record, dict) else None
-                        if not isinstance(counts, dict) or not all(
-                            isinstance(reason, str)
-                            and not isinstance(count, bool)
-                            and isinstance(count, int)
-                            and count >= 0
-                            for reason, count in counts.items()
+                        if (
+                            not isinstance(record, dict)
+                            or not isinstance(record.get("reason"), str)
+                            or not record["reason"]
                         ):
                             return None
-                        final_counts = counts
-        except (OSError, pa.ArrowInvalid, json.JSONDecodeError, TypeError, ValueError):
+                        observed += 1
+        except (KeyError, OSError, pa.ArrowInvalid, json.JSONDecodeError, TypeError, ValueError):
             return None
-        if final_counts is None:
+        if observed == 0:
             return None
-        total_clamps += sum(final_counts.values())
+        total_clamps += observed
     return {
         "ungated": 0,
         "clamps": total_clamps,
@@ -528,6 +528,7 @@ def rollout(
     run_dir = root / "runs" / run_id
     traces_dir = run_dir / "traces"
     traces_dir.mkdir(parents=True, exist_ok=True)
+    launch_trace_dirs = [traces_dir]
     exec_graph = instrumented_graph(graph, root, run_dir)
     results_path = run_dir / "episodes.jsonl"
 
@@ -643,6 +644,7 @@ def rollout(
                 relaunch_traces = traces_dir / f"relaunch-{relaunches}"
                 relaunch_traces.mkdir(parents=True, exist_ok=True)
                 current_traces = relaunch_traces
+                launch_trace_dirs.append(relaunch_traces)
                 exec_graph = instrumented_graph(
                     graph,
                     root,
@@ -706,7 +708,7 @@ def rollout(
         env_attested = False
     wall_s = time.monotonic() - started
     metrics = compute_metrics(episode_records)
-    safety = observed_safety(traces_dir, episode_records)
+    safety = observed_safety(launch_trace_dirs, episode_records, topology_validated=True)
     videos = sorted(str(p.relative_to(root)) for p in traces_dir.rglob("*.mp4"))
     manifest = {
         "run_id": run_id,

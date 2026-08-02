@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import subprocess
@@ -21,6 +20,7 @@ _GENESIS_BUILD_BUDGET_S = 420.0
 _S1_EPISODE_BUDGET_S = 2100.0
 _ZERO_SAFETY = SafetyResult(ungated=0, clamps=0, extra_item=0)
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_ABSENT_CANDIDATE_HASH = "0" * 64
 
 CommandRunner = Callable[[list[str], float], subprocess.CompletedProcess[str]]
 ScriptPreflightRunner = Callable[[Path], PreflightResult]
@@ -89,7 +89,12 @@ def _normal_preflight(response: dict, started: float) -> PreflightResult:
 
 
 def _attempt_failure(
-    run_id: str, candidate_hash: str, preflight: PreflightResult, code: str, started: float
+    run_id: str,
+    candidate_hash: str,
+    preflight: PreflightResult,
+    code: str,
+    started: float,
+    artifacts: dict[str, str] | None = None,
 ) -> AttemptResult:
     return AttemptResult(
         attempt_id=run_id,
@@ -99,16 +104,16 @@ def _attempt_failure(
         failures={code: 1},
         safety=_ZERO_SAFETY,
         timing={"wall_s": time.monotonic() - started, "sim_s": 0.0},
-        artifacts={},
+        artifacts={} if artifacts is None else artifacts,
     )
 
 
 def _candidate_hash(candidate: Path) -> tuple[str, bool]:
-    """Return a byte hash, or a deterministic missing-input identity for refusals."""
+    """Return a byte hash, or the reserved absent-candidate refusal sentinel."""
     try:
         return sha256_file(candidate), True
     except OSError:
-        return hashlib.sha256(f"missing-candidate:{candidate}".encode()).hexdigest(), False
+        return _ABSENT_CANDIDATE_HASH, False
 
 
 def _valid_rollout_inputs(seeds: str, run_id: str) -> bool:
@@ -209,7 +214,14 @@ class AisleAdapter:
         candidate_hash, candidate_exists = _candidate_hash(candidate_path)
         if not candidate_exists:
             preflight = PreflightResult(ok=False, errors=({"code": "INFRA_ARGUMENT"},), wall_s=0.0)
-            return _attempt_failure(run_id, candidate_hash, preflight, "INFRA_ARGUMENT", started)
+            return _attempt_failure(
+                run_id,
+                candidate_hash,
+                preflight,
+                "INFRA_ARGUMENT",
+                started,
+                {"candidate_identity": "absent"},
+            )
         cached = self._preflights.get(candidate_path)
         preflight = (
             cached[1]
@@ -314,7 +326,14 @@ class ScriptAdapter:
         candidate_hash, candidate_exists = _candidate_hash(candidate_path)
         if not candidate_exists:
             preflight = PreflightResult(ok=False, errors=({"code": "INFRA_ARGUMENT"},), wall_s=0.0)
-            return _attempt_failure(run_id, candidate_hash, preflight, "INFRA_ARGUMENT", started)
+            return _attempt_failure(
+                run_id,
+                candidate_hash,
+                preflight,
+                "INFRA_ARGUMENT",
+                started,
+                {"candidate_identity": "absent"},
+            )
         cached = self._preflights.get(candidate_path)
         preflight = (
             cached[1]

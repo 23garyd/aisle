@@ -28,6 +28,7 @@ _ATTEMPT_KEYS = frozenset(
 _PREFLIGHT_KEYS = frozenset({"ok", "errors", "wall_s"})
 _SAFETY_KEYS = frozenset({"ungated", "clamps", "extra_item"})
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_ABSENT_CANDIDATE_HASH = "0" * 64
 _LEDGER_KEYS = frozenset({"seq", "prev_sha256", "event", "sha256"})
 
 
@@ -257,15 +258,26 @@ class AttemptResult:
             raw["candidate_hash"]
         ):
             raise ValueError("candidate_hash must be a lowercase SHA-256 hex digest")
+        failures = _count_dict(raw["failures"], "failures")
+        artifacts = _string_dict(raw["artifacts"], "artifacts")
+        if raw["candidate_hash"] == _ABSENT_CANDIDATE_HASH:
+            if artifacts.get("candidate_identity") != "absent" or failures != {"INFRA_ARGUMENT": 1}:
+                raise ValueError(
+                    "candidate_hash all-zero sentinel is reserved for absent INFRA_ARGUMENT"
+                )
+        elif artifacts.get("candidate_identity") == "absent":
+            raise ValueError(
+                "candidate_identity absent requires the reserved all-zero candidate_hash"
+            )
         return cls(
             attempt_id=raw["attempt_id"],
             candidate_hash=raw["candidate_hash"],
             preflight=PreflightResult.from_dict(raw["preflight"]),
             episodes=_dict_list(raw["episodes"], "episodes"),
-            failures=_count_dict(raw["failures"], "failures"),
+            failures=failures,
             safety=SafetyResult.from_dict(raw["safety"]),
             timing=_timing_dict(raw["timing"]),
-            artifacts=_string_dict(raw["artifacts"], "artifacts"),
+            artifacts=artifacts,
         )
 
     def to_dict(self) -> dict:

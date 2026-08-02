@@ -51,6 +51,32 @@ def test_attempt_result_round_trip_and_rejects_unknown_fields():
         AttemptResult.from_dict({**raw, "condition": "aisle"})
 
 
+def test_attempt_result_reserves_zero_hash_for_absent_candidate_refusals_only():
+    """CON-5, CON-8: absent candidates have one explicit identity; byte hashes never alias it."""
+    from aisle.harness.ablation import AttemptResult
+
+    absent = {
+        **_attempt(),
+        "candidate_hash": "0" * 64,
+        "failures": {"INFRA_ARGUMENT": 1},
+        "artifacts": {"candidate_identity": "absent"},
+    }
+    assert AttemptResult.from_dict(absent).to_dict() == absent
+    assert (
+        AttemptResult.from_dict(
+            {**absent, "artifacts": {"candidate_identity": "absent", "request": "missing"}}
+        ).artifacts["request"]
+        == "missing"
+    )
+
+    with pytest.raises(ValueError, match="reserved"):
+        AttemptResult.from_dict({**absent, "artifacts": {}})
+    with pytest.raises(ValueError, match="reserved"):
+        AttemptResult.from_dict({**absent, "failures": {"INFRA_PROTOCOL": 1}})
+    with pytest.raises(ValueError, match="candidate_identity"):
+        AttemptResult.from_dict({**absent, "candidate_hash": "a" * 64})
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [
@@ -868,7 +894,8 @@ def test_script_adapter_maps_missing_candidate_to_stable_argument_failure(tmp_pa
     result = ScriptAdapter().rollout(candidate, "3", "A-01")
 
     assert result.failures == {"INFRA_ARGUMENT": 1}
-    assert len(result.candidate_hash) == 64
+    assert result.candidate_hash == "0" * 64
+    assert result.artifacts == {"candidate_identity": "absent"}
 
 
 def test_script_adapter_preflight_failure_measures_elapsed_wall_time(tmp_path: Path):

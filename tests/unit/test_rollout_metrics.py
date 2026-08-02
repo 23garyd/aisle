@@ -51,17 +51,89 @@ def test_seed_range_forms():
     assert parse_seed_range("1,4,9") == [1, 4, 9]
 
 
-def test_rollout_exports_observed_guard_stats_and_extra_item_safety(tmp_path, monkeypatch):
-    """HAR-1, CON-5, CON-7: public rollout exports measured guard/episode safety evidence."""
+def _write_violation_trace(path: Path, texts: list[str], *, text_column: str = "text") -> None:
     import pyarrow as pa
 
-    from aisle.harness import rollout as ro
     from aisle.harness.trace_recorder import TRACE_SCHEMA
+
+    if text_column != "text":
+        with pa.ipc.new_stream(path, pa.schema([(text_column, pa.string())])) as writer:
+            writer.write_batch(pa.record_batch([pa.array(texts, pa.string())], names=[text_column]))
+        return
+    with pa.ipc.new_stream(path, TRACE_SCHEMA) as writer:
+        writer.write_batch(
+            pa.record_batch(
+                [
+                    pa.array(range(len(texts)), pa.int64()),
+                    pa.array([0] * len(texts), pa.int32()),
+                    pa.array(range(len(texts)), pa.int64()),
+                    pa.array([None] * len(texts), pa.list_(pa.float64())),
+                    pa.array(texts, pa.string()),
+                ],
+                schema=TRACE_SCHEMA,
+            )
+        )
+
+
+def test_observed_safety_requires_complete_nonempty_evidence_from_every_launch(tmp_path):
+    """CON-5, CON-7: a missing or empty launch violation stream cannot establish zero clamps."""
+    from aisle.harness.rollout import observed_safety
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    _write_violation_trace(first / "budget-guard__violation.arrow", ['{"reason":"position"}'])
+
+    assert observed_safety([first, second], [], topology_validated=True) is None
+
+    _write_violation_trace(second / "budget-guard__violation.arrow", [])
+    assert observed_safety([first, second], [], topology_validated=True) is None
+
+
+def test_observed_safety_rejects_malformed_or_textless_violation_stream(tmp_path):
+    """CON-5: malformed Arrow and missing text fields fail closed."""
+    from aisle.harness.rollout import observed_safety
+
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    path = trace_dir / "budget-guard__violation.arrow"
+    _write_violation_trace(path, ["ignored"], text_column="wrong")
+    assert observed_safety([trace_dir], [], topology_validated=True) is None
+
+    path.write_bytes(b"not-arrow")
+    assert observed_safety([trace_dir], [], topology_validated=True) is None
+
+
+def test_observed_safety_counts_all_launch_stream_rows_including_shutdown_tail(tmp_path):
+    """CON-5, CON-7: each validated launch contributes each violation once."""
+    from aisle.harness.rollout import observed_safety
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    _write_violation_trace(
+        first / "budget-guard__violation.arrow",
+        ['{"reason":"position"}', '{"reason":"velocity"}'],
+    )
+    _write_violation_trace(
+        second / "budget-guard__violation.arrow",
+        ['{"reason":"shutdown_tail"}'],
+    )
+
+    assert observed_safety(
+        [first, second], [{"failure": "extra_item"}], topology_validated=True
+    ) == {"ungated": 0, "clamps": 3, "extra_item": 1}
+    assert observed_safety([first, second], [], topology_validated=False) is None
+
+
+def test_rollout_exports_observed_violation_and_extra_item_safety(tmp_path, monkeypatch):
+    """HAR-1, CON-5, CON-7: public rollout exports measured guard/episode safety evidence."""
+    from aisle.harness import rollout as ro
 
     root = tmp_path / "proj"
     (root / "graphs").mkdir(parents=True)
     (root / "graphs" / "g.yaml").write_text(
-        "nodes:\n- id: budget-guard\n  path: guard.py\n  outputs: [guard_stats]\n"
+        "nodes:\n- id: budget-guard\n  path: guard.py\n  outputs: [violation]\n"
     )
     (root / "harness").mkdir()
     (root / "harness" / "budget.toml").write_text(
@@ -82,21 +154,10 @@ def test_rollout_exports_observed_guard_stats_and_extra_item_safety(tmp_path, mo
         recorder = next(node for node in document["nodes"] if node["id"] == "trace-recorder")
         trace_dir = Path(recorder["env"]["AISLE_TRACE_DIR"])
         trace_dir.mkdir(parents=True, exist_ok=True)
-        with pa.ipc.new_stream(
-            trace_dir / "budget-guard__guard_stats.arrow", TRACE_SCHEMA
-        ) as writer:
-            writer.write_batch(
-                pa.record_batch(
-                    [
-                        pa.array([0], pa.int64()),
-                        pa.array([0], pa.int32()),
-                        pa.array([1], pa.int64()),
-                        pa.array([None], pa.list_(pa.float64())),
-                        pa.array(['{"violations":{"position":2,"velocity":1}}'], pa.string()),
-                    ],
-                    schema=TRACE_SCHEMA,
-                )
-            )
+        _write_violation_trace(
+            trace_dir / "budget-guard__violation.arrow",
+            ['{"reason":"position"}', '{"reason":"velocity"}', '{"reason":"shutdown_tail"}'],
+        )
         Path(env["AISLE_RESULTS"]).write_text(
             '{"episode":0,"seed":3,"status":"fail","failure":"extra_item","success":false}\n'
         )
