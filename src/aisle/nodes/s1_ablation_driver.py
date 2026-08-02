@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import os
 
-from aisle.harness.s1_ablation_common import S1StarterStateMachine
+from aisle.harness.s1_ablation_common import (
+    S1StarterStateMachine,
+    action_intent_metadata,
+)
 
 
 class S1AblationDriver:
@@ -53,6 +56,7 @@ def main() -> None:
     send = make_sender(node)
     driver = S1AblationDriver(int(os.environ.get("AISLE_SEED", "0")))
     nav_seq = 0
+    intent_seq = 0
 
     for event in node:
         if event["type"] != "INPUT":
@@ -67,17 +71,25 @@ def main() -> None:
         else:
             payload = {"values": event["value"].to_numpy(zero_copy_only=False).reshape(-1).tolist()}
         for command in driver.on_event(kind, payload):
+            intent_seq += 1
+            intent_metadata = {
+                **metadata,
+                **action_intent_metadata(command, intent_seq),
+            }
             if command["kind"] == "nav_goal":
                 nav_seq += 1
                 send(
                     "nav_goal",
                     pa.array([json.dumps(command["payload"])]),
-                    {"goal_id": f"ablation-nav-{nav_seq:04d}"},
+                    {
+                        **intent_metadata,
+                        "goal_id": f"ablation-nav-{nav_seq:04d}",
+                    },
                 )
             elif command["kind"] == "gripper_cmd":
                 action = command["payload"]["action"]
                 value = np.array([1.0 if action == "close" else 0.0], dtype=np.float32)
-                send("gripper_cmd", pa.array(value), metadata)
+                send("gripper_cmd", pa.array(value), intent_metadata)
 
 
 if __name__ == "__main__":

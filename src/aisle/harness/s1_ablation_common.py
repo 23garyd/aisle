@@ -126,3 +126,18 @@ def canonical_action_intent(events: list[dict]) -> list[dict]:
             continue
         raise ValueError(f"unsupported starter command kind {kind!r}")
     return normalized
+
+
+def action_intent_metadata(event: dict, sequence: int) -> dict:
+    """Attach one representation-neutral starter intent to serialized output."""
+    intent = canonical_action_intent([event])[0]
+    return normalized_intent_metadata(intent, sequence)
+
+
+def normalized_intent_metadata(intent: dict, sequence: int) -> dict:
+    """Serialize one already-normalized action intent into dora metadata."""
+    return {
+        "intent_seq": sequence,
+        "intent_action": intent["action"],
+        "intent_target": intent["target"],
+    }

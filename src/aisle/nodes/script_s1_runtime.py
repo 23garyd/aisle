@@ -54,6 +54,7 @@ class PreparedCommand:
     kind: str
     payload: list[float] | dict
     wire_value: object
+    action_intent: dict | None
 
 
 def policy_event_from_dora(kind: str, value, metadata: dict | None) -> PolicyEvent:
@@ -128,6 +129,12 @@ def prepare_commands(commands: object) -> list[PreparedCommand]:
             if type(kind) is not str or kind not in _COMMAND_KINDS:
                 raise CommandInvalid("command kind must be nav_goal, joint_cmd, or gripper_cmd")
             payload = command.payload
+            try:
+                from aisle.harness.s1_ablation_common import canonical_action_intent
+
+                action_intent = canonical_action_intent([{"kind": kind, "payload": payload}])[0]
+            except ValueError:
+                action_intent = None
             if kind == "nav_goal":
                 if not isinstance(payload, dict) or not _json_value_is_valid(payload):
                     raise CommandInvalid("nav_goal payload must be a JSON-compatible dict")
@@ -138,10 +145,12 @@ def prepare_commands(commands: object) -> list[PreparedCommand]:
                     separators=(",", ":"),
                 )
                 payload = json.loads(serialized)
-                prepared.append(PreparedCommand(kind, payload, pa.array([serialized])))
+                prepared.append(
+                    PreparedCommand(kind, payload, pa.array([serialized]), action_intent)
+                )
             elif kind == "joint_cmd":
                 payload, wire_value = _numeric_wire_value(payload, _JOINT_DOF, "joint_cmd")
-                prepared.append(PreparedCommand(kind, payload, wire_value))
+                prepared.append(PreparedCommand(kind, payload, wire_value, action_intent))
             else:
                 if isinstance(payload, dict) and set(payload) in (
                     {"action"},
@@ -156,7 +165,7 @@ def prepare_commands(commands: object) -> list[PreparedCommand]:
                         raise CommandInvalid("gripper product_id must be a non-empty string")
                     payload = [0.0 if action == "open" else 1.0]
                 normalized, wire_value = _numeric_wire_value(payload, 1, "gripper_cmd")
-                prepared.append(PreparedCommand(kind, normalized, wire_value))
+                prepared.append(PreparedCommand(kind, normalized, wire_value, action_intent))
         return prepared
     except CommandInvalid:
         raise
@@ -165,20 +174,39 @@ def prepare_commands(commands: object) -> list[PreparedCommand]:
 
 
 def _emit_prepared_commands(
-    commands: list[PreparedCommand], send, metadata: dict, nav_seq: int
-) -> int:
+    commands: list[PreparedCommand],
+    send,
+    metadata: dict,
+    nav_seq: int,
+    intent_seq: int,
+) -> tuple[int, int]:
+    from aisle.harness.s1_ablation_common import normalized_intent_metadata
+
     for command in commands:
         output_meta = metadata
+        if command.action_intent is not None:
+            intent_seq += 1
+            output_meta = {
+                **output_meta,
+                **normalized_intent_metadata(command.action_intent, intent_seq),
+            }
         if command.kind == "nav_goal":
             nav_seq += 1
-            output_meta = {**metadata, "goal_id": f"script-nav-{nav_seq:04d}"}
+            output_meta = {**output_meta, "goal_id": f"script-nav-{nav_seq:04d}"}
         send(command.kind, command.wire_value, output_meta)
-    return nav_seq
+    return nav_seq, intent_seq
 
 
 def emit_policy_commands(commands: object, send, metadata: dict, nav_seq: int) -> int:
     """Prepare a complete batch before its first dora output."""
-    return _emit_prepared_commands(prepare_commands(commands), send, metadata, nav_seq)
+    next_nav_seq, _ = _emit_prepared_commands(
+        prepare_commands(commands),
+        send,
+        metadata,
+        nav_seq,
+        intent_seq=0,
+    )
+    return next_nav_seq
 
 
 def _load_factory(path: Path):
@@ -232,6 +260,7 @@ def main() -> None:
     node = Node()
     send = make_sender(node)
     nav_seq = 0
+    intent_seq = 0
 
     for raw_event in node:
         if raw_event["type"] != "INPUT":
@@ -265,7 +294,13 @@ def main() -> None:
             )
             commands = prepare_commands(_call_policy(policy, event))
             send("policy_event", event_wire_value, output_meta)
-            nav_seq = _emit_prepared_commands(commands, send, output_meta, nav_seq)
+            nav_seq, intent_seq = _emit_prepared_commands(
+                commands,
+                send,
+                output_meta,
+                nav_seq,
+                intent_seq,
+            )
         except CommandInvalid as exc:
             raise SystemExit(str(exc)) from exc
         except PolicyInvalid as exc:

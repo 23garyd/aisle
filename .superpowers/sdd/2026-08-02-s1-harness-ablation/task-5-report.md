@@ -217,3 +217,76 @@ toolkit, or driver file was changed.
   `registry/schema/curated_core.toml`. That allowlist is Class C and
   CODEOWNERS-protected; the change was TDD-pinned in registry completeness and
   requires human review before merge.
+
+## Fix Round 1
+
+Closed the review finding that the original physical live helper stopped after
+the first navigation event. Added a bounded, simulator-free dora dataflow that
+feeds controlled neutral goal/order/plan/pose/navigation events through the
+actual `s1-ablation-driver` and `script-s1-runtime` node mains, records their
+serialized `nav_goal` and `gripper_cmd` outputs, and requires this exact
+representation-neutral sequence from both:
+
+```text
+nav shelf_zone_A
+pick A1-L1-S0#0
+nav counter
+place A1-L1-S0#0
+```
+
+Serialized starter outputs now carry ordered `intent_seq`, `intent_action`,
+and `intent_target` metadata. Script commands still pass through whole-batch
+validation and scalar gripper serialization; typed commands still use their
+node adapter's JSON/scalar wire paths. The controlled test independently
+asserts both navigation JSON payloads and both scalar gripper values
+`[1.0, 0.0]`.
+
+RED against the one-event implementation:
+
+```text
+pytest tests/graph/test_s1_ablation_starters.py::\
+test_controlled_dataflow_matches_all_four_serialized_action_intents -q -s
+
+1 failed in 9.87s
+KeyError: 'intent_seq'
+```
+
+The first GREEN attempt exposed script navigation metadata being overwritten
+when its `goal_id` was attached. After preserving the already-built intent
+metadata, the focused dataflow test passed:
+
+```text
+1 passed in 9.73s
+```
+
+After simplifying the metadata adapter, fresh verification passed:
+
+```text
+controlled four-action dataflow:
+1 passed in 9.67s
+
+shared conformance + protected script regressions:
+69 passed in 0.31s
+
+typed topology + controlled dataflow (physical live test deselected):
+5 passed, 1 deselected in 9.68s
+
+full unit gate:
+639 passed, 1 skipped, 108 deselected in 219.86s
+
+ruff format --check .:
+161 files already formatted
+
+ruff check .:
+All checks passed
+
+trace check:
+{"ok": true, "uncovered": [], "unknown_citations": [], "errors": []}
+```
+
+The physical simulator arms were not rerun. Their seed/goal/oracle evidence
+from the original bounded run remains unchanged. The touched oracle digest
+canonicalization now explicitly uses `sort_keys=True`. No verifier wait,
+dependency/environment change, CUDA workload, or simulator process was
+started in this fix round; controlled dora processes were terminated and
+reaped from their exact temporary cwd.
