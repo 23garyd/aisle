@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import json
+import os
+import random
 import re
 from dataclasses import dataclass
 from math import isfinite
+from pathlib import Path
 from typing import Any
 
 _ATTEMPT_KEYS = frozenset(
@@ -22,6 +28,111 @@ _ATTEMPT_KEYS = frozenset(
 _PREFLIGHT_KEYS = frozenset({"ok", "errors", "wall_s"})
 _SAFETY_KEYS = frozenset({"ungated", "clamps", "extra_item"})
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_LEDGER_KEYS = frozenset({"seq", "prev_sha256", "event", "sha256"})
+
+
+def paired_assignments(seed: int, pairs: int) -> list[str]:
+    """Return seeded, pair-adjacent assignments for the two ablation arms."""
+    if isinstance(pairs, bool) or not isinstance(pairs, int) or pairs < 0:
+        raise ValueError("pairs must be a non-negative integer")
+
+    rng = random.Random(seed)
+    assignments: list[str] = []
+    for _ in range(pairs):
+        pair = ["aisle", "script"]
+        rng.shuffle(pair)
+        assignments.extend(pair)
+    return assignments
+
+
+def sha256_file(path: Path) -> str:
+    """Return the SHA-256 digest of a file's exact bytes."""
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _ledger_hash(seq: int, prev_sha256: str | None, event: dict) -> str:
+    payload = _canonical_json({"seq": seq, "prev_sha256": prev_sha256, "event": event}).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _parse_ledger(lines: list[str]) -> tuple[bool, str | None]:
+    previous: str | None = None
+    for expected_seq, line in enumerate(lines, start=1):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return False, None
+        if not isinstance(record, dict) or set(record) != _LEDGER_KEYS:
+            return False, None
+        seq = record["seq"]
+        prev_sha256 = record["prev_sha256"]
+        event = record["event"]
+        entry_sha256 = record["sha256"]
+        if (
+            isinstance(seq, bool)
+            or not isinstance(seq, int)
+            or seq != expected_seq
+            or prev_sha256 != previous
+            or not isinstance(event, dict)
+            or not isinstance(entry_sha256, str)
+            or not _SHA256_RE.fullmatch(entry_sha256)
+        ):
+            return False, None
+        if entry_sha256 != _ledger_hash(seq, prev_sha256, event):
+            return False, None
+        previous = entry_sha256
+    return True, previous
+
+
+def append_ledger(path: Path, event: dict) -> str:
+    """Append a canonical hash-chained event under an exclusive file lock."""
+    if not isinstance(event, dict):
+        raise ValueError("event must be a dict")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as ledger:
+        fcntl.flock(ledger.fileno(), fcntl.LOCK_EX)
+        try:
+            ledger.seek(0)
+            lines = ledger.read().splitlines()
+            valid, previous = _parse_ledger(lines)
+            if not valid:
+                raise ValueError("ledger verification failed before append")
+            seq = len(lines) + 1
+            entry_sha256 = _ledger_hash(seq, previous, event)
+            record = {
+                "seq": seq,
+                "prev_sha256": previous,
+                "event": event,
+                "sha256": entry_sha256,
+            }
+            ledger.seek(0, os.SEEK_END)
+            ledger.write(_canonical_json(record) + "\n")
+            ledger.flush()
+            os.fsync(ledger.fileno())
+            return entry_sha256
+        finally:
+            fcntl.flock(ledger.fileno(), fcntl.LOCK_UN)
+
+
+def verify_ledger(path: Path) -> tuple[bool, str | None]:
+    """Return whether a JSONL ledger verifies and its verified head hash."""
+    if not path.exists():
+        return True, None
+    try:
+        return _parse_ledger(path.read_text(encoding="utf-8").splitlines())
+    except OSError:
+        return False, None
 
 
 def _require_exact_keys(value: object, expected: frozenset[str], name: str) -> dict[str, Any]:

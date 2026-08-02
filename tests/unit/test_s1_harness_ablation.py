@@ -1,5 +1,6 @@
 """Unit tests for the S1 harness-versus-script neutral attempt schema."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -54,3 +55,53 @@ def test_attempt_result_rejects_malformed_values(field: str, value: object, erro
 
     with pytest.raises(ValueError, match=error):
         AttemptResult.from_dict(raw)
+
+
+def test_paired_assignments_are_seeded_and_balanced():
+    """CON-5: seeded paired blocks assign each condition exactly once."""
+    from aisle.harness.ablation import paired_assignments
+
+    assignments = paired_assignments(seed=1, pairs=8)
+
+    assert assignments == paired_assignments(seed=1, pairs=8)
+    assert assignments != paired_assignments(seed=2, pairs=8)
+    assert len(assignments) == 16
+    assert all(
+        set(assignments[index : index + 2]) == {"aisle", "script"}
+        for index in range(0, len(assignments), 2)
+    )
+
+
+def test_sha256_file_hashes_exact_file_bytes(tmp_path: Path):
+    """CON-5: artifact identities hash bytes, not platform text decoding."""
+    from aisle.harness.ablation import sha256_file
+
+    path = tmp_path / "candidate.py"
+    path.write_bytes(b"aisle\n")
+
+    assert sha256_file(path) == "77f7420162f5fc97aeb5c147ced4b7b67f4bbc632a2c53ac53d353c603e12399"
+
+
+def test_session_ledger_is_canonical_hash_chained_and_tamper_evident(tmp_path: Path):
+    """HAR-1, CON-5: immutable session events verify as one hash chain."""
+    from aisle.harness.ablation import append_ledger, verify_ledger
+
+    path = tmp_path / "session.jsonl"
+    first = append_ledger(path, {"kind": "session_start", "session": "P01-A"})
+    second = append_ledger(path, {"kind": "attempt", "attempt": "A-0001"})
+    head = append_ledger(path, {"kind": "session_end", "status": "agent_done"})
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record["seq"] for record in records] == [1, 2, 3]
+    assert [record["prev_sha256"] for record in records] == [None, first, second]
+    assert all(
+        line == json.dumps(record, sort_keys=True, separators=(",", ":"))
+        for line, record in zip(path.read_text().splitlines(), records, strict=True)
+    )
+    assert verify_ledger(path) == (True, head)
+
+    lines = path.read_text().splitlines()
+    lines[1] = lines[1].replace("A-0001", "A-0002")
+    path.write_text("\n".join(lines) + "\n")
+
+    assert verify_ledger(path) == (False, None)
