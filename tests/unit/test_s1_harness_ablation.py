@@ -1,6 +1,7 @@
 """Unit tests for the S1 harness-versus-script neutral attempt schema."""
 
 import json
+import signal
 import sys
 from contextlib import redirect_stdout
 from io import StringIO
@@ -387,6 +388,165 @@ def test_script_runtime_rejects_all_commands_before_any_can_be_emitted():
         prepare_commands(commands)
 
 
+@pytest.mark.parametrize(
+    ("kind", "payload"),
+    [
+        ("joint_cmd", [0.0] * 8 + ["1.0"]),
+        ("joint_cmd", [0.0] * 8 + [float("nan")]),
+        ("joint_cmd", [0.0] * 8 + [float("inf")]),
+        ("joint_cmd", [0.0] * 8 + [1e39]),
+        ("gripper_cmd", ["1.0"]),
+        ("nav_goal", {"pose": [0.0, object(), 0.0]}),
+        ("nav_goal", {1: "counter"}),
+    ],
+)
+def test_script_runtime_deep_rejects_forged_or_mutated_payloads(kind: str, payload: object):
+    """BG-1, CON-8: runtime distrusts forged PolicyCommand payload internals."""
+    from aisle.nodes.script_s1_runtime import CommandInvalid, prepare_commands
+    from baselines.script_s1.contract import PolicyCommand
+
+    command = object.__new__(PolicyCommand)
+    object.__setattr__(command, "kind", kind)
+    object.__setattr__(command, "payload", payload)
+
+    with pytest.raises(CommandInvalid, match="COMMAND_INVALID"):
+        prepare_commands([command])
+
+
+def test_script_runtime_emits_nothing_when_a_later_command_is_invalid():
+    """BG-1, CON-8: the whole batch is wire-ready before its first emission."""
+    from aisle.nodes.script_s1_runtime import CommandInvalid, emit_policy_commands
+    from baselines.script_s1.contract import PolicyCommand
+
+    invalid = object.__new__(PolicyCommand)
+    object.__setattr__(invalid, "kind", "gripper_cmd")
+    object.__setattr__(invalid, "payload", ["1.0"])
+    emitted: list[tuple] = []
+
+    with pytest.raises(CommandInvalid, match="COMMAND_INVALID"):
+        emit_policy_commands(
+            [PolicyCommand("joint_cmd", [0.0] * 9), invalid],
+            lambda *args: emitted.append(args),
+            {"sim_time_ns": 10, "env_id": 0},
+            nav_seq=0,
+        )
+
+    assert emitted == []
+
+
+def _episode_record(episode: int, seed: int) -> dict:
+    return {
+        "episode": episode,
+        "seed": seed,
+        "status": "fail",
+        "failure": "timeout",
+        "t_end": 4.5,
+        "success": False,
+        "penalties": ["timeout"],
+        "placement_scores": [],
+        "goal_id": f"ep-{episode:04d}",
+        "verifier": "oracle",
+        "suite": "retail",
+    }
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"x": 1},
+        {**_episode_record(0, 3), "episode": "0"},
+        {**_episode_record(0, 3), "seed": "3"},
+        {**_episode_record(0, 3), "status": "ongoing"},
+        {**_episode_record(0, 3), "success": True},
+        {**_episode_record(0, 3), "t_end": float("nan")},
+        {**_episode_record(0, 3), "penalties": [1]},
+        {**_episode_record(0, 3), "failure": "extra_item"},
+        {**_episode_record(0, 3), "penalties": ["invented"]},
+        {**_episode_record(0, 3), "placement_scores": [1]},
+        {
+            **_episode_record(0, 3),
+            "placement_scores": [
+                {
+                    "item": "item-1",
+                    "slot": "A1-L0-S0",
+                    "pos": "true",
+                    "yaw": True,
+                    "front_face": True,
+                    "overhang": True,
+                    "alignment": True,
+                }
+            ],
+        },
+        {**_episode_record(0, 3), "goal_id": "forged"},
+        {**_episode_record(0, 3), "verifier": "realistic"},
+        {**_episode_record(0, 3), "verifier": "candidate"},
+        {**_episode_record(0, 3), "suite": "desk"},
+    ],
+)
+def test_script_rollout_rejects_malformed_episode_records(tmp_path: Path, record: dict):
+    """HAR-1, CON-8: arbitrary or ill-typed JSON cannot count as an episode."""
+    from aisle.harness.script_rollout import _read_episode_results
+
+    path = tmp_path / "episodes.jsonl"
+    path.write_text(json.dumps(record) + "\n")
+
+    assert _read_episode_results(path, [3]) == ([], 1)
+
+
+def test_script_rollout_rejects_wrong_seed_and_episode_order(tmp_path: Path):
+    """HAR-1, CON-5: only the requested seed sequence can complete a rollout."""
+    from aisle.harness.script_rollout import _read_episode_results
+
+    path = tmp_path / "episodes.jsonl"
+    path.write_text(
+        "\n".join(
+            (
+                json.dumps(_episode_record(1, 4)),
+                json.dumps(_episode_record(0, 99)),
+                json.dumps(_episode_record(0, 3)),
+                json.dumps(_episode_record(1, 4)),
+            )
+        )
+        + "\n"
+    )
+
+    assert _read_episode_results(path, [3, 4]) == (
+        [_episode_record(0, 3), _episode_record(1, 4)],
+        2,
+    )
+
+
+def test_script_rollout_waits_after_forced_sigkill(monkeypatch):
+    """CON-8: forced script graph cleanup reaps the killed child process."""
+    from aisle.harness import script_rollout
+
+    signals: list[int] = []
+
+    class StuckProcess:
+        pid = 12345
+
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                raise script_rollout.subprocess.TimeoutExpired("dora", timeout)
+            return -signal.SIGKILL
+
+    process = StuckProcess()
+    monkeypatch.setattr(
+        script_rollout.os,
+        "killpg",
+        lambda pid, sent_signal: signals.append(sent_signal),
+    )
+
+    script_rollout._terminate_script(process)
+
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert process.waits == 2
+
+
 def test_run_script_rollout_launches_fixed_wrapper_and_returns_attempt_result(
     tmp_path: Path, monkeypatch
 ):
@@ -413,9 +573,7 @@ def test_run_script_rollout_launches_fixed_wrapper_and_returns_attempt_result(
 
     def launch(graph: Path, run_dir: Path, env: dict, stderr):
         captured.update(graph=graph, run_dir=run_dir, env=env)
-        Path(env["AISLE_RESULTS"]).write_text(
-            '{"episode":0,"seed":3,"status":"fail","failure":"timeout","t_end":4.5}\n'
-        )
+        Path(env["AISLE_RESULTS"]).write_text(json.dumps(_episode_record(0, 3)) + "\n")
         return CompletedGraph()
 
     monkeypatch.setattr(script_rollout, "_repository_root", lambda: tmp_path)
@@ -426,9 +584,7 @@ def test_run_script_rollout_launches_fixed_wrapper_and_returns_attempt_result(
     result = script_rollout.run_script_rollout(policy, "3", "script-unit")
 
     assert result.attempt_id == "script-unit"
-    assert result.episodes == (
-        {"episode": 0, "seed": 3, "status": "fail", "failure": "timeout", "t_end": 4.5},
-    )
+    assert result.episodes == (_episode_record(0, 3),)
     assert result.failures == {"timeout": 1}
     assert result.safety.to_dict() == {"ungated": 0, "clamps": 0, "extra_item": 0}
     assert Path(captured["graph"]).parent == Path(captured["run_dir"])

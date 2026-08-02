@@ -10,6 +10,7 @@ requests are shape-checked, not safety-clamped here: the unchanged
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from contextlib import redirect_stdout
@@ -51,6 +52,7 @@ class PreparedCommand:
 
     kind: str
     payload: list[float] | dict
+    wire_value: object
 
 
 def policy_event_from_dora(kind: str, value, metadata: dict | None) -> PolicyEvent:
@@ -69,6 +71,42 @@ def policy_event_from_dora(kind: str, value, metadata: dict | None) -> PolicyEve
     return PolicyEvent(kind=kind, payload=payload, sim_time_ns=int(raw_time))
 
 
+def _json_value_is_valid(value: object) -> bool:
+    if value is None or isinstance(value, (str, bool)):
+        return True
+    if isinstance(value, int) and not isinstance(value, bool):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_json_value_is_valid(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str) and _json_value_is_valid(item) for key, item in value.items()
+        )
+    return False
+
+
+def _numeric_wire_value(payload: object, length: int, label: str):
+    import numpy as np
+    import pyarrow as pa
+
+    if not isinstance(payload, list) or len(payload) != length:
+        raise CommandInvalid(f"{label} payload must be a {length}-value list")
+    if not all(
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        for value in payload
+    ):
+        raise CommandInvalid(f"{label} payload must contain finite numbers")
+    with np.errstate(over="ignore", invalid="ignore"):
+        array = np.asarray(payload, dtype=np.float32)
+    if not bool(np.isfinite(array).all()):
+        raise CommandInvalid(f"{label} payload must be finite Float32 values")
+    return array.tolist(), pa.array(array)
+
+
 def prepare_commands(commands: object) -> list[PreparedCommand]:
     """Validate a whole candidate batch before returning any emissions.
 
@@ -78,34 +116,62 @@ def prepare_commands(commands: object) -> list[PreparedCommand]:
     if not isinstance(commands, list):
         raise CommandInvalid("on_event must return a list")
 
-    prepared: list[PreparedCommand] = []
-    for command in commands:
-        if not isinstance(command, PolicyCommand):
-            raise CommandInvalid("every result must be a PolicyCommand")
-        if command.kind == "nav_goal":
-            if not isinstance(command.payload, dict):
-                raise CommandInvalid("nav_goal payload must be a dict")
-            prepared.append(PreparedCommand(command.kind, dict(command.payload)))
-        elif command.kind == "joint_cmd":
-            if not isinstance(command.payload, list) or len(command.payload) != _JOINT_DOF:
-                raise CommandInvalid(f"joint_cmd payload must be a {_JOINT_DOF}-value list")
-            prepared.append(PreparedCommand(command.kind, list(command.payload)))
-        elif command.kind == "gripper_cmd":
-            payload = command.payload
-            if isinstance(payload, list) and len(payload) == 1:
-                prepared.append(PreparedCommand(command.kind, list(payload)))
-            elif isinstance(payload, dict) and set(payload) == {"action"}:
-                action = payload["action"]
-                if action not in ("open", "close"):
-                    raise CommandInvalid("gripper action must be open or close")
-                prepared.append(PreparedCommand(command.kind, [0.0 if action == "open" else 1.0]))
-            else:
-                raise CommandInvalid(
-                    "gripper_cmd payload must be a one-value list or an open/close action"
+    import pyarrow as pa
+
+    try:
+        prepared: list[PreparedCommand] = []
+        for command in commands:
+            if not isinstance(command, PolicyCommand):
+                raise CommandInvalid("every result must be a PolicyCommand")
+            if command.kind == "nav_goal":
+                if not isinstance(command.payload, dict) or not _json_value_is_valid(
+                    command.payload
+                ):
+                    raise CommandInvalid("nav_goal payload must be a JSON-compatible dict")
+                serialized = json.dumps(
+                    command.payload,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
                 )
-        else:  # defensive if a forged object bypasses PolicyCommand.__post_init__
-            raise CommandInvalid(f"undeclared command kind {command.kind!r}")
-    return prepared
+                payload = json.loads(serialized)
+                prepared.append(PreparedCommand(command.kind, payload, pa.array([serialized])))
+            elif command.kind == "joint_cmd":
+                payload, wire_value = _numeric_wire_value(command.payload, _JOINT_DOF, "joint_cmd")
+                prepared.append(PreparedCommand(command.kind, payload, wire_value))
+            elif command.kind == "gripper_cmd":
+                payload = command.payload
+                if isinstance(payload, dict) and set(payload) == {"action"}:
+                    action = payload["action"]
+                    if action not in ("open", "close"):
+                        raise CommandInvalid("gripper action must be open or close")
+                    payload = [0.0 if action == "open" else 1.0]
+                normalized, wire_value = _numeric_wire_value(payload, 1, "gripper_cmd")
+                prepared.append(PreparedCommand(command.kind, normalized, wire_value))
+            else:  # defensive if a forged object bypasses PolicyCommand.__post_init__
+                raise CommandInvalid(f"undeclared command kind {command.kind!r}")
+        return prepared
+    except CommandInvalid:
+        raise
+    except Exception as exc:
+        raise CommandInvalid(f"command serialization failed: {type(exc).__name__}") from exc
+
+
+def _emit_prepared_commands(
+    commands: list[PreparedCommand], send, metadata: dict, nav_seq: int
+) -> int:
+    for command in commands:
+        output_meta = metadata
+        if command.kind == "nav_goal":
+            nav_seq += 1
+            output_meta = {**metadata, "goal_id": f"script-nav-{nav_seq:04d}"}
+        send(command.kind, command.wire_value, output_meta)
+    return nav_seq
+
+
+def emit_policy_commands(commands: object, send, metadata: dict, nav_seq: int) -> int:
+    """Prepare a complete batch before its first dora output."""
+    return _emit_prepared_commands(prepare_commands(commands), send, metadata, nav_seq)
 
 
 def _load_factory(path: Path):
@@ -131,7 +197,7 @@ def _create_policy(factory, seed: int):
     return policy
 
 
-def _call_policy(policy, event: PolicyEvent) -> list[PreparedCommand]:
+def _call_policy(policy, event: PolicyEvent) -> object:
     try:
         with redirect_stdout(StringIO()):
             commands = policy.on_event(event)
@@ -139,11 +205,10 @@ def _call_policy(policy, event: PolicyEvent) -> list[PreparedCommand]:
         raise CommandInvalid(str(exc)) from exc
     except Exception as exc:
         raise PolicyInvalid(f"policy on_event failed: {type(exc).__name__}") from exc
-    return prepare_commands(commands)
+    return commands
 
 
 def main() -> None:
-    import numpy as np
     import pyarrow as pa
     from dora import Node
 
@@ -181,28 +246,12 @@ def main() -> None:
                 "env_id": int(metadata.get("env_id", 0)),
                 "sim_time_ns": event.sim_time_ns,
             }
-            send(
-                "policy_event",
-                pa.array([json.dumps(event_record, sort_keys=True, separators=(",", ":"))]),
-                output_meta,
+            event_wire_value = pa.array(
+                [json.dumps(event_record, sort_keys=True, separators=(",", ":"))]
             )
-            commands = _call_policy(policy, event)
-            for command in commands:
-                if command.kind == "nav_goal":
-                    nav_seq += 1
-                    send(
-                        "nav_goal",
-                        pa.array(
-                            [json.dumps(command.payload, sort_keys=True, separators=(",", ":"))]
-                        ),
-                        {**output_meta, "goal_id": f"script-nav-{nav_seq:04d}"},
-                    )
-                else:
-                    send(
-                        command.kind,
-                        pa.array(np.asarray(command.payload, dtype=np.float32)),
-                        output_meta,
-                    )
+            commands = prepare_commands(_call_policy(policy, event))
+            send("policy_event", event_wire_value, output_meta)
+            nav_seq = _emit_prepared_commands(commands, send, output_meta, nav_seq)
         except CommandInvalid as exc:
             raise SystemExit(str(exc)) from exc
         except PolicyInvalid as exc:

@@ -160,3 +160,72 @@ Requirement traceability used by the tests: `CON-5`, `CON-7`, `CON-8`,
   minimal addition is required because the protected runtime is fixed hub
   infrastructure rather than an agent-authored evalcarded skill; human review
   is required before merge.
+
+## Fix Round 1
+
+Addressed all three review findings without another simulator or CUDA run:
+
+1. The script runtime now distrusts `PolicyCommand` internals even when a
+   frozen instance is forged or mutated. It recursively rejects non-JSON
+   navigation values, non-numeric or non-finite numeric commands, and values
+   that overflow Float32. A complete command batch is converted to final Arrow
+   values before either the policy event or any command is emitted, and every
+   command validation/serialization failure is normalized to
+   `COMMAND_INVALID`.
+2. Script rollout results now count only structurally valid terminal retail
+   oracle records in the requested episode/seed order. Required top-level and
+   nested verifier fields are type-checked, status/success/failure/penalty
+   relationships are checked, goal IDs and the oracle/retail discriminators are
+   fixed, and malformed rows are reported as `RESULT_INVALID` without
+   completing an episode.
+3. Forced cleanup now performs an unconditional blocking `wait()` after
+   `SIGKILL`, with a regression test proving the killed child is reaped.
+
+### RED evidence
+
+The first review regression selection failed exactly at the missing
+protections:
+
+```text
+pytest tests/unit/test_s1_harness_ablation.py \
+  -k 'deep_rejects or emits_nothing or rejects_malformed_episode or \
+      wrong_seed_and_episode_order or forced_sigkill' -q
+19 failed, 36 deselected
+```
+
+After the main result-schema fix, supplementary nested verifier checks were
+also introduced RED:
+
+```text
+pytest tests/unit/test_s1_harness_ablation.py \
+  -k rejects_malformed_episode_records -q
+5 failed, 10 passed, 46 deselected
+```
+
+### GREEN evidence
+
+```text
+env -u PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  UV_PROJECT_ENVIRONMENT=/home/demo/Public/github_aisle/aisle-latest/.venv \
+  uv run --no-sync pytest tests/unit/test_s1_harness_ablation.py -q
+61 passed in 0.29s
+```
+
+Static and topology gates:
+
+```text
+uv run --no-sync ruff format --check .
+154 files already formatted
+uv run --no-sync ruff check .
+All checks passed
+harness validate graphs/ablation_script_s1_wrapper.yaml \
+  --root . --embodiment mobile
+{"ok": true, "errors": [], "warnings": []}
+python tools/trace_check.py --root .
+{"ok": true, "uncovered": [], "unknown_citations": [], "errors": []}
+git diff --check
+(clean)
+```
+
+Per the fix-round instruction, no CUDA smoke was rerun. The earlier single
+live smoke remains the simulator evidence for the unchanged graph topology.

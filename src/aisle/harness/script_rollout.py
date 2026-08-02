@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import signal
@@ -39,29 +40,138 @@ def _spawn_script_dora(graph: Path, run_dir: Path, env: dict[str, str], stderr) 
 def _terminate_script(proc: subprocess.Popen) -> None:
     try:
         os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
         proc.wait(timeout=20)
-    except (subprocess.TimeoutExpired, ProcessLookupError):
+        return
+    except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        proc.wait()
 
 
-def _read_episode_results(path: Path) -> tuple[list[dict], bool]:
+_EPISODE_REQUIRED = frozenset(
+    {
+        "episode",
+        "seed",
+        "status",
+        "failure",
+        "t_end",
+        "success",
+        "penalties",
+        "placement_scores",
+        "goal_id",
+        "verifier",
+        "suite",
+    }
+)
+_RETAIL_FAILURES = frozenset(
+    {
+        "misplaced",
+        "misaligned",
+        "overhang",
+        "wrong_slot",
+        "missing_item",
+        "extra_item",
+        "timeout",
+    }
+)
+_PLACEMENT_SCORE_KEYS = frozenset(
+    {"item", "slot", "pos", "yaw", "front_face", "overhang", "alignment"}
+)
+
+
+def _placement_score_is_valid(score: object) -> bool:
+    return (
+        isinstance(score, dict)
+        and set(score) == _PLACEMENT_SCORE_KEYS
+        and isinstance(score["item"], str)
+        and bool(score["item"])
+        and isinstance(score["slot"], str)
+        and bool(score["slot"])
+        and all(
+            isinstance(score[criterion], bool)
+            for criterion in ("pos", "yaw", "front_face", "overhang", "alignment")
+        )
+    )
+
+
+def _episode_record_is_valid(record: object, episode: int, seed: int) -> bool:
+    if not isinstance(record, dict) or not _EPISODE_REQUIRED <= set(record):
+        return False
+    if (
+        isinstance(record["episode"], bool)
+        or not isinstance(record["episode"], int)
+        or record["episode"] != episode
+    ):
+        return False
+    if (
+        isinstance(record["seed"], bool)
+        or not isinstance(record["seed"], int)
+        or record["seed"] != seed
+    ):
+        return False
+    status = record["status"]
+    success = record["success"]
+    failure = record["failure"]
+    if status not in ("success", "fail") or not isinstance(success, bool):
+        return False
+    if success != (status == "success"):
+        return False
+    if status == "success" and failure is not None:
+        return False
+    if status == "fail" and (not isinstance(failure, str) or not failure):
+        return False
+    t_end = record["t_end"]
+    if (
+        isinstance(t_end, bool)
+        or not isinstance(t_end, (int, float))
+        or not math.isfinite(float(t_end))
+        or t_end < 0
+    ):
+        return False
+    penalties = record["penalties"]
+    if not isinstance(penalties, list) or not all(
+        isinstance(penalty, str) and penalty in _RETAIL_FAILURES for penalty in penalties
+    ):
+        return False
+    if status == "success" and penalties:
+        return False
+    if status == "fail" and (not penalties or failure != penalties[0]):
+        return False
+    scores = record["placement_scores"]
+    if not isinstance(scores, list) or not all(
+        _placement_score_is_valid(score) for score in scores
+    ):
+        return False
+    if record["goal_id"] != f"ep-{episode:04d}":
+        return False
+    if record["verifier"] != "oracle" or record["suite"] != "retail":
+        return False
+    return True
+
+
+def _read_episode_results(path: Path, expected_seeds: list[int]) -> tuple[list[dict], int]:
     if not path.exists():
-        return [], False
+        return [], 0
     records: list[dict] = []
-    malformed = False
+    malformed = 0
     for line in path.read_text().splitlines():
         if not line.strip():
             continue
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
-            malformed = True
+            malformed += 1
             continue
-        if not isinstance(record, dict):
-            malformed = True
+        expected_episode = len(records)
+        if expected_episode >= len(expected_seeds) or not _episode_record_is_valid(
+            record, expected_episode, expected_seeds[expected_episode]
+        ):
+            malformed += 1
             continue
         records.append(record)
     return records, malformed
@@ -157,7 +267,7 @@ def run_script_rollout(policy: Path, seeds: str, run_id: str) -> AttemptResult:
         try:
             proc = _spawn_script_dora(exec_graph, run_dir, env, stderr)
             while time.monotonic() < deadline:
-                completed, _ = _read_episode_results(results_path)
+                completed, _ = _read_episode_results(results_path, seed_values)
                 if len(completed) >= len(seed_values) or proc.poll() is not None:
                     break
                 time.sleep(0.2)
@@ -169,13 +279,13 @@ def run_script_rollout(policy: Path, seeds: str, run_id: str) -> AttemptResult:
             reap_orphans(run_dir)
 
     wall_s = time.monotonic() - started
-    episodes, malformed = _read_episode_results(results_path)
+    episodes, malformed = _read_episode_results(results_path, seed_values)
     failures = _failure_counts(episodes)
     if malformed:
-        failures["RESULT_INVALID"] = failures.get("RESULT_INVALID", 0) + 1
+        failures["RESULT_INVALID"] = malformed
     if launch_error is not None:
         failures[launch_error] = failures.get(launch_error, 0) + 1
-    elif len(episodes) < len(seed_values):
+    elif len(episodes) < len(seed_values) and not malformed:
         runtime_log = stderr_path.read_text(errors="replace")
         code = "COMMAND_INVALID" if "COMMAND_INVALID" in runtime_log else "ROLLOUT_INCOMPLETE"
         failures[code] = failures.get(code, 0) + 1
