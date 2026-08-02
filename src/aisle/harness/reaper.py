@@ -40,6 +40,7 @@ NODE_PATTERNS = (
     "nodes/s1_expert.py",
     "nodes/order_reader.py",
     "nodes/task_planner.py",
+    "nodes/script_s1_runtime.py",
     "verifier/retail.py",
 )
 

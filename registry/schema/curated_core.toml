@@ -24,6 +24,7 @@ core = [
   "reset",
   "rollout-client",
   "s1-expert",
+  "script-s1-runtime",
   "stock-detector",
   "task-planner",
   "task-state-machine",

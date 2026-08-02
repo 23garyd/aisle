@@ -7,8 +7,12 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).parents[2]))
+
+REPO_ROOT = Path(__file__).parents[2]
 
 
 def _attempt() -> dict:
@@ -231,3 +235,224 @@ def test_script_preflight_accepts_policy_stdout_noise(tmp_path: Path):
     assert exit_code == 0
     assert result == {"ok": True}
     assert output == '{"ok":true}\n'
+
+
+def _graph_nodes(path: Path) -> dict[str, dict]:
+    document = yaml.safe_load(path.read_text())
+    return {node["id"]: node for node in document["nodes"]}
+
+
+def test_script_wrapper_keeps_oracle_state_outside_the_editable_policy():
+    """CON-7: the script policy receives observations but never privileged oracle_state."""
+    nodes = _graph_nodes(REPO_ROOT / "graphs" / "ablation_script_s1_wrapper.yaml")
+
+    runtime = nodes["script-s1-runtime"]
+    assert set(runtime["inputs"]) == {
+        "episode_goal",
+        "poses",
+        "joint_state",
+        "base_pose",
+        "nav_result",
+        "reset_done",
+    }
+    assert all(
+        source.get("source") != "dora-genesis/oracle_state" for source in runtime["inputs"].values()
+    )
+    assert nodes["verifier-retail"]["inputs"]["oracle_state"]["source"] == (
+        "dora-genesis/oracle_state"
+    )
+
+
+def test_script_wrapper_routes_every_motion_command_through_budget_guard():
+    """BG-1, MOB-3: script arm and navigation base motion reach Genesis only via the guard."""
+    nodes = _graph_nodes(REPO_ROOT / "graphs" / "ablation_script_s1_wrapper.yaml")
+
+    bridge_inputs = nodes["dora-genesis"]["inputs"]
+    guard_inputs = nodes["budget-guard"]["inputs"]
+    assert bridge_inputs["joint_cmd"]["source"] == "budget-guard/joint_cmd_safe"
+    assert bridge_inputs["gripper_cmd"]["source"] == "budget-guard/gripper_cmd_safe"
+    assert bridge_inputs["base_cmd"]["source"] == "budget-guard/base_cmd_safe"
+    assert guard_inputs["joint_cmd"]["source"] == "script-s1-runtime/joint_cmd"
+    assert guard_inputs["gripper_cmd"]["source"] == "script-s1-runtime/gripper_cmd"
+    assert guard_inputs["base_cmd"]["source"] == "waypoint-nav/base_cmd"
+    assert nodes["waypoint-nav"]["inputs"]["nav_goal"]["source"] == ("script-s1-runtime/nav_goal")
+
+
+def test_script_wrapper_reuses_frozen_s1_reset_and_verifier_sources():
+    """CON-7: script and expert S1 arms share the exact reset and verifier sources."""
+    expert = _graph_nodes(REPO_ROOT / "graphs" / "expert_s1.yaml")
+    wrapper = _graph_nodes(REPO_ROOT / "graphs" / "ablation_script_s1_wrapper.yaml")
+
+    assert wrapper["reset"]["path"] == expert["reset"]["path"]
+    assert wrapper["verifier-retail"]["path"] == expert["verifier-retail"]["path"]
+
+
+def test_script_wrapper_has_one_policy_behavioral_node():
+    """CON-7: the one candidate-controlled behavior surface is the fixed script runtime."""
+    expert = _graph_nodes(REPO_ROOT / "graphs" / "expert_s1.yaml")
+    wrapper = _graph_nodes(REPO_ROOT / "graphs" / "ablation_script_s1_wrapper.yaml")
+    fixed_ids = {
+        "dora-genesis",
+        "reset",
+        "budget-guard",
+        "waypoint-nav",
+        "verifier-retail",
+        "rollout-client",
+    }
+
+    assert set(wrapper) == fixed_ids | {"script-s1-runtime"}
+    assert all(wrapper[node_id]["path"] == expert[node_id]["path"] for node_id in fixed_ids)
+    assert wrapper["script-s1-runtime"]["path"] == "../src/aisle/nodes/script_s1_runtime.py"
+
+
+def test_script_wrapper_exposes_policy_events_without_raw_node_traces():
+    """CON-7: script agents receive policy_event diagnostics, not AISLE per-node traces."""
+    nodes = _graph_nodes(REPO_ROOT / "graphs" / "ablation_script_s1_wrapper.yaml")
+
+    assert "policy_event" in nodes["script-s1-runtime"]["outputs"]
+    assert "trace-recorder" not in nodes
+    assert all("AISLE_TRACE_DIR" not in (node.get("env") or {}) for node in nodes.values())
+
+
+def test_script_runtime_normalizes_dora_inputs_as_policy_events():
+    """CON-5: fixed translation gives script policies deterministic JSON observations."""
+    import pyarrow as pa
+
+    from aisle.nodes.script_s1_runtime import policy_event_from_dora
+
+    goal = policy_event_from_dora(
+        "episode_goal",
+        pa.array(['{"order":[{"product":"ibuprofen","qty":1}]}']),
+        {"sim_time_ns": 12},
+    )
+    state = policy_event_from_dora(
+        "joint_state",
+        pa.array([0.25, -0.5]),
+        {"sim_time_ns": 34},
+    )
+
+    assert goal.kind == "episode_goal"
+    assert goal.payload == {"order": [{"product": "ibuprofen", "qty": 1}]}
+    assert goal.sim_time_ns == 12
+    assert state.kind == "joint_state"
+    assert state.payload == {"values": [0.25, -0.5]}
+    assert state.sim_time_ns == 34
+
+
+def test_script_runtime_preserves_well_shaped_unsafe_commands_for_the_guard():
+    """BG-1..3: runtime preserves unsafe requests so the external guard clamps them."""
+    from aisle.nodes.script_s1_runtime import prepare_commands
+    from baselines.script_s1.contract import PolicyCommand
+
+    unsafe_joint_request = [99.0] * 9
+    commands = prepare_commands(
+        [
+            PolicyCommand("joint_cmd", unsafe_joint_request),
+            PolicyCommand("gripper_cmd", [99.0]),
+        ]
+    )
+
+    assert commands[0].kind == "joint_cmd"
+    assert commands[0].payload == unsafe_joint_request
+    assert commands[1].kind == "gripper_cmd"
+    assert commands[1].payload == [99.0]
+
+
+def test_script_runtime_translates_declared_semantic_gripper_actions():
+    """BG-1: documented open/close commands serialize to the guarded scalar channel."""
+    from aisle.nodes.script_s1_runtime import prepare_commands
+    from baselines.script_s1.contract import PolicyCommand
+
+    commands = prepare_commands(
+        [
+            PolicyCommand("gripper_cmd", {"action": "open"}),
+            PolicyCommand("gripper_cmd", {"action": "close"}),
+        ]
+    )
+
+    assert [command.payload for command in commands] == [[0.0], [1.0]]
+
+
+def test_script_runtime_rejects_all_commands_before_any_can_be_emitted():
+    """BG-1, CON-8: malformed command batches terminate atomically as COMMAND_INVALID."""
+    from aisle.nodes.script_s1_runtime import CommandInvalid, prepare_commands
+    from baselines.script_s1.contract import PolicyCommand
+
+    commands = [
+        PolicyCommand("joint_cmd", [0.0] * 9),
+        PolicyCommand("joint_cmd", [0.0] * 8),
+    ]
+
+    with pytest.raises(CommandInvalid, match="COMMAND_INVALID"):
+        prepare_commands(commands)
+
+
+def test_run_script_rollout_launches_fixed_wrapper_and_returns_attempt_result(
+    tmp_path: Path, monkeypatch
+):
+    """HAR-1, BG-1: rollout launches only the fixed wrapper and parses neutral results."""
+    from aisle.harness import script_rollout
+
+    graph_dir = tmp_path / "graphs"
+    graph_dir.mkdir()
+    (graph_dir / "ablation_script_s1_wrapper.yaml").write_text(
+        (REPO_ROOT / "graphs" / "ablation_script_s1_wrapper.yaml").read_text()
+    )
+    policy = tmp_path / "candidate.py"
+    policy.write_text("def create_policy(seed):\n    return object()\n")
+    captured: dict[str, object] = {}
+
+    class CompletedGraph:
+        pid = 999_999_999
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+    def launch(graph: Path, run_dir: Path, env: dict, stderr):
+        captured.update(graph=graph, run_dir=run_dir, env=env)
+        Path(env["AISLE_RESULTS"]).write_text(
+            '{"episode":0,"seed":3,"status":"fail","failure":"timeout","t_end":4.5}\n'
+        )
+        return CompletedGraph()
+
+    monkeypatch.setattr(script_rollout, "_repository_root", lambda: tmp_path)
+    monkeypatch.setattr(script_rollout, "_spawn_script_dora", launch)
+    monkeypatch.setattr(script_rollout, "_terminate_script", lambda proc: None)
+    monkeypatch.setattr(script_rollout, "reap_orphans", lambda run_dir: None)
+
+    result = script_rollout.run_script_rollout(policy, "3", "script-unit")
+
+    assert result.attempt_id == "script-unit"
+    assert result.episodes == (
+        {"episode": 0, "seed": 3, "status": "fail", "failure": "timeout", "t_end": 4.5},
+    )
+    assert result.failures == {"timeout": 1}
+    assert result.safety.to_dict() == {"ungated": 0, "clamps": 0, "extra_item": 0}
+    assert Path(captured["graph"]).parent == Path(captured["run_dir"])
+    env = captured["env"]
+    assert env["AISLE_SCRIPT_POLICY"] == str(policy.resolve())
+    assert env["AISLE_SEED"] == "3"
+    assert env["AISLE_SEEDS"] == "3"
+    assert env["PYTHONPATH"] == f"{tmp_path / 'src'}:{tmp_path}"
+    assert "traces_dir" not in result.artifacts
+
+
+def test_run_script_rollout_refuses_unsafe_run_ids(tmp_path: Path):
+    """CON-8: a traversal-shaped script run id cannot escape the external run store."""
+    from aisle.harness.script_rollout import run_script_rollout
+
+    policy = tmp_path / "candidate.py"
+    policy.write_text("def create_policy(seed):\n    return object()\n")
+
+    with pytest.raises(ValueError, match="unsafe run_id"):
+        run_script_rollout(policy, "0", "../escape")
+
+
+def test_script_runtime_is_in_the_fixed_orphan_reaper():
+    """CON-7: script rollout cleanup includes its fixed candidate-hosting node."""
+    from aisle.harness.reaper import NODE_PATTERNS
+
+    assert "nodes/script_s1_runtime.py" in NODE_PATTERNS

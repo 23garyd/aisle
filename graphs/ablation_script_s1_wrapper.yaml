@@ -1,0 +1,150 @@
+# Fixed S1 script-policy wrapper. The candidate is selected only through
+# AISLE_SCRIPT_POLICY; every graph edge remains fixed and all arm/base motion
+# reaches Genesis through the unchanged budget-guard.
+nodes:
+  - id: dora-genesis
+    path: ../src/aisle/nodes/dora_genesis.py
+    env:
+      AISLE_SCENE: store
+      AISLE_SCENARIO: S1
+      AISLE_EMBODIMENT: mobile
+    inputs:
+      tick: dora/timer/millis/10
+      joint_cmd:
+        source: budget-guard/joint_cmd_safe
+        queue_size: 100
+      gripper_cmd:
+        source: budget-guard/gripper_cmd_safe
+        queue_size: 100
+      base_cmd:
+        source: budget-guard/base_cmd_safe
+        queue_size: 100
+      reset:
+        source: reset/bridge_reset
+        queue_size: 100
+    outputs:
+      - bridge_info
+      - joint_state
+      - gripper_state
+      - oracle_state
+      - poses
+      - reset_done
+      - base_pose
+      - base_scan
+      - frame_info
+      - rgb_overhead
+
+  - id: reset
+    path: ../src/aisle/reset/service.py
+    inputs:
+      reset:
+        source: rollout-client/reset
+        queue_size: 100
+      reset_done:
+        source: dora-genesis/reset_done
+        queue_size: 100
+    outputs:
+      - bridge_reset
+      - reset_done
+
+  - id: budget-guard
+    path: ../src/aisle/nodes/budget_guard.py
+    env:
+      AISLE_EMBODIMENT: mobile
+      AISLE_SCENE: store
+    inputs:
+      tick: dora/timer/millis/5000
+      base_watchdog: dora/timer/millis/50
+      joint_cmd:
+        source: script-s1-runtime/joint_cmd
+        queue_size: 100
+      gripper_cmd:
+        source: script-s1-runtime/gripper_cmd
+        queue_size: 100
+      base_cmd:
+        source: waypoint-nav/base_cmd
+        queue_size: 100
+      base_pose:
+        source: dora-genesis/base_pose
+        queue_size: 1
+      reset_done:
+        source: dora-genesis/reset_done
+        queue_size: 100
+    outputs:
+      - joint_cmd_safe
+      - gripper_cmd_safe
+      - base_cmd_safe
+      - violation
+      - guard_stats
+
+  - id: waypoint-nav
+    path: ../src/aisle/nodes/nav_action.py
+    env:
+      AISLE_EMBODIMENT: mobile
+    inputs:
+      tick: dora/timer/millis/20
+      nav_goal:
+        source: script-s1-runtime/nav_goal
+        queue_size: 100
+      base_pose:
+        source: dora-genesis/base_pose
+        queue_size: 1
+    outputs:
+      - nav_feedback
+      - nav_result
+      - base_cmd
+
+  - id: script-s1-runtime
+    path: ../src/aisle/nodes/script_s1_runtime.py
+    inputs:
+      episode_goal:
+        source: rollout-client/episode_goal
+        queue_size: 100
+      poses:
+        source: dora-genesis/poses
+        queue_size: 1
+      joint_state:
+        source: dora-genesis/joint_state
+        queue_size: 1
+      base_pose:
+        source: dora-genesis/base_pose
+        queue_size: 1
+      nav_result:
+        source: waypoint-nav/nav_result
+        queue_size: 100
+      reset_done:
+        source: dora-genesis/reset_done
+        queue_size: 100
+    outputs:
+      - nav_goal
+      - joint_cmd
+      - gripper_cmd
+      - policy_event
+
+  - id: verifier-retail
+    path: ../src/aisle/verifier/retail.py
+    inputs:
+      oracle_state:
+        source: dora-genesis/oracle_state
+        queue_size: 100
+      episode_goal:
+        source: rollout-client/episode_goal
+        queue_size: 100
+    outputs:
+      - episode_result
+
+  - id: rollout-client
+    path: ../src/aisle/harness/rollout_client.py
+    env:
+      AISLE_TIER: S1
+    inputs:
+      tick: dora/timer/millis/1000
+      reset_done:
+        source: reset/reset_done
+        queue_size: 100
+      episode_result:
+        source: verifier-retail/episode_result
+        queue_size: 100
+    outputs:
+      - reset
+      - episode_goal

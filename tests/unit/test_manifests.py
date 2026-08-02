@@ -44,6 +44,8 @@ EXPECTED_IDS = {
     # T15 S1 expert graph (ADR-18)
     "verifier-retail",
     "s1-expert",
+    # Fixed protected runtime for the S1 script ablation
+    "script-s1-runtime",
 }
 
 
