@@ -2,6 +2,7 @@
 
 import json
 import signal
+import subprocess
 import sys
 from contextlib import redirect_stdout
 from io import StringIO
@@ -638,3 +639,198 @@ def test_script_runtime_is_in_the_fixed_orphan_reaper():
     from aisle.harness.reaper import NODE_PATTERNS
 
     assert "nodes/script_s1_runtime.py" in NODE_PATTERNS
+
+
+def _adapter_rollout_report(run_id: str) -> dict:
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "episodes": [_episode_record(0, 3)],
+        "failures": {"timeout": 1},
+        "safety": {"ungated": 0, "clamps": 2, "extra_item": 0},
+        "durations": {"wall_s": 1.25, "sim_s": 4.5},
+        "traces_dir": "runs/unit/traces",
+        "videos": ["runs/unit/traces/overhead.mp4"],
+    }
+
+
+def test_aisle_adapter_uses_fixed_harness_argv_and_normalizes_result(tmp_path: Path):
+    """HAR-1, CON-5, CON-8: AISLE invokes validate/rollout through one neutral record boundary."""
+    from aisle.harness.ablation_adapters import AisleAdapter
+
+    candidate = tmp_path / "candidate.yaml"
+    candidate.write_text("nodes: []\n")
+    calls: list[tuple[list[str], float]] = []
+
+    def run(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
+        calls.append((argv, timeout))
+        if argv[1] == "validate":
+            return subprocess.CompletedProcess(
+                argv, 0, '{"ok":true,"errors":[],"warnings":[]}\n', ""
+            )
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps(_adapter_rollout_report("A-01")) + "\n", ""
+        )
+
+    adapter = AisleAdapter(tmp_path, runner=run)
+
+    preflight = adapter.preflight(candidate)
+    result = adapter.rollout(candidate, "3", "A-01")
+
+    assert preflight.ok is True
+    assert [timeout for _, timeout in calls] == [30.0, 2520.0]
+    assert [argv for argv, _ in calls] == [
+        [
+            "harness",
+            "validate",
+            str(candidate.resolve()),
+            "--root",
+            str(tmp_path.resolve()),
+            "--embodiment",
+            "mobile",
+        ],
+        [
+            "harness",
+            "rollout",
+            "--graph",
+            str(candidate.resolve()),
+            "--tier",
+            "S1",
+            "--embodiment",
+            "mobile",
+            "--episodes",
+            "1",
+            "--seeds",
+            "3",
+            "--reset",
+            "teleport",
+            "--verifier",
+            "oracle",
+            "--root",
+            str(tmp_path.resolve()),
+            "--no-idea-gate",
+            "--run-id",
+            "A-01",
+        ],
+    ]
+    assert result.attempt_id == "A-01"
+    assert (
+        result.candidate_hash == "704056ab12a52a1a941fd543cb0207a1117d3fb8884a0428a7c7ccce5feb946e"
+    )
+    assert result.failures == {"timeout": 1}
+    assert result.safety.to_dict() == {"ungated": 0, "clamps": 2, "extra_item": 0}
+    assert result.timing == {"wall_s": 1.25, "sim_s": 4.5}
+    assert result.artifacts == {
+        "traces_dir": "runs/unit/traces",
+        "video_0": "runs/unit/traces/overhead.mp4",
+    }
+
+
+def test_script_adapter_uses_preflight_and_protected_runner_without_harness_validation(
+    tmp_path: Path,
+):
+    """HAR-1, CON-7, CON-8: script candidates use the isolated gate and protected runner."""
+    from aisle.harness.ablation import AttemptResult, PreflightResult, SafetyResult
+    from aisle.harness.ablation_adapters import ScriptAdapter
+
+    candidate = tmp_path / "candidate.py"
+    candidate.write_text("def create_policy(seed):\n    return object()\n")
+    preflight_calls: list[Path] = []
+    rollout_calls: list[tuple[Path, str, str]] = []
+
+    def preflight(path: Path) -> PreflightResult:
+        preflight_calls.append(path)
+        return PreflightResult(ok=True, errors=(), wall_s=0.25)
+
+    def rollout(path: Path, seeds: str, run_id: str) -> AttemptResult:
+        rollout_calls.append((path, seeds, run_id))
+        return AttemptResult(
+            attempt_id=run_id,
+            candidate_hash="0" * 64,
+            preflight=PreflightResult(ok=True, errors=(), wall_s=0.0),
+            episodes=(_episode_record(0, 3),),
+            failures={"timeout": 1},
+            safety=SafetyResult(ungated=0, clamps=2, extra_item=0),
+            timing={"wall_s": 1.25, "sim_s": 4.5},
+            artifacts={
+                "policy_log": "runs/unit/policy_events.jsonl",
+                "raw_trace": "runs/unit/traces/secret.arrow",
+            },
+        )
+
+    adapter = ScriptAdapter(preflight_runner=preflight, rollout_runner=rollout)
+    result = adapter.rollout(candidate, "3", "A-01")
+
+    assert preflight_calls == [candidate]
+    assert rollout_calls == [(candidate, "3", "A-01")]
+    assert (
+        result.candidate_hash == "7396a812496952c23c81b50f59a1c9f4b51b987c0da3a34b2c2783ea30c03d3e"
+    )
+    assert result.preflight.to_dict() == {"ok": True, "errors": [], "wall_s": 0.25}
+    assert result.failures == {"timeout": 1}
+    assert result.safety.to_dict() == {"ungated": 0, "clamps": 2, "extra_item": 0}
+    assert result.timing == {"wall_s": 1.25, "sim_s": 4.5}
+    assert adapter.collect_deliverable(candidate) == {"policy_log": "runs/unit/policy_events.jsonl"}
+
+
+@pytest.mark.parametrize(
+    ("stdout", "error_code"),
+    [
+        ('{"ok":true}{"ok":true}', "INFRA_PROTOCOL"),
+        ("not-json", "INFRA_PROTOCOL"),
+    ],
+)
+def test_aisle_adapter_fails_closed_on_non_single_json_stdout(
+    tmp_path: Path, stdout: str, error_code: str
+):
+    """CON-8: adapter subprocess responses must contain exactly one JSON object."""
+    from aisle.harness.ablation_adapters import AisleAdapter
+
+    candidate = tmp_path / "candidate.yaml"
+    candidate.write_text("nodes: []\n")
+
+    def run(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    result = AisleAdapter(tmp_path, runner=run).preflight(candidate)
+
+    assert result.ok is False
+    assert result.errors[0]["code"] == error_code
+
+
+def test_adapters_map_subprocess_timeouts_to_the_same_stable_failure(tmp_path: Path):
+    """CON-5, CON-8: external command timeouts normalize to deterministic infrastructure records."""
+    from aisle.harness.ablation_adapters import AisleAdapter
+
+    candidate = tmp_path / "candidate.yaml"
+    candidate.write_text("nodes: []\n")
+
+    def timeout(argv: list[str], timeout_s: float) -> subprocess.CompletedProcess:
+        raise subprocess.TimeoutExpired(argv, timeout_s)
+
+    result = AisleAdapter(tmp_path, runner=timeout).rollout(candidate, "3", "A-01")
+
+    assert result.preflight.errors[0]["code"] == "INFRA_TIMEOUT"
+    assert result.failures == {"PREFLIGHT_FAILED": 1}
+
+
+def test_aisle_adapter_fails_closed_when_rollout_omits_guard_evidence(tmp_path: Path):
+    """CON-5, CON-7: unavailable AISLE guard evidence must not be recorded as observed zero."""
+    from aisle.harness.ablation_adapters import AisleAdapter
+
+    candidate = tmp_path / "candidate.yaml"
+    candidate.write_text("nodes: []\n")
+    report = _adapter_rollout_report("A-01")
+    del report["safety"]
+
+    def run(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
+        stdout = '{"ok":true,"errors":[],"warnings":[]}\n'
+        if argv[1] == "rollout":
+            stdout = json.dumps(report) + "\n"
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    adapter = AisleAdapter(tmp_path, runner=run)
+    adapter.preflight(candidate)
+    result = adapter.rollout(candidate, "3", "A-01")
+
+    assert result.failures == {"INFRA_SAFETY_UNAVAILABLE": 1}
