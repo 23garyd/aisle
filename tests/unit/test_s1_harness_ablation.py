@@ -2,6 +2,8 @@
 
 import json
 import sys
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,17 @@ def _attempt() -> dict:
         "timing": {"wall_s": 1.0, "sim_s": 0.0},
         "artifacts": {},
     }
+
+
+def _run_script_preflight_worker(path: Path) -> tuple[int, dict, str]:
+    """Run the isolated worker logic and return its exact stdout JSON result."""
+    from aisle.harness.script_preflight_worker import main
+
+    stdout = StringIO()
+    with redirect_stdout(stdout):
+        exit_code = main([str(path.resolve())])
+    output = stdout.getvalue()
+    return exit_code, json.loads(output), output
 
 
 def test_attempt_result_round_trip_and_rejects_unknown_fields():
@@ -146,22 +159,17 @@ def test_ledger_invalid_utf8_tampering_returns_invalid_result(tmp_path: Path):
 )
 def test_script_preflight_returns_stable_failure_codes(tmp_path: Path, source: str, code: str):
     """HAR-1, CON-8: invalid script candidates fail before any runtime launch."""
-    from aisle.harness.script_preflight import preflight_script
-
     path = tmp_path / "candidate.py"
     path.write_text(source)
 
-    result = preflight_script(path)
+    exit_code, result, _ = _run_script_preflight_worker(path)
 
-    assert result.ok is False
-    assert result.errors == ({"code": code},)
-    assert result.wall_s >= 0.0
+    assert exit_code == 1
+    assert result == {"code": code, "ok": False}
 
 
 def test_script_preflight_accepts_a_valid_policy(tmp_path: Path):
     """HAR-1, CON-8: a policy with a valid synthetic-goal command passes preflight."""
-    from aisle.harness.script_preflight import preflight_script
-
     path = tmp_path / "candidate.py"
     path.write_text(
         "from baselines.script_s1.contract import PolicyCommand\n"
@@ -174,18 +182,52 @@ def test_script_preflight_accepts_a_valid_policy(tmp_path: Path):
         "    return Policy()\n"
     )
 
-    result = preflight_script(path)
+    exit_code, result, _ = _run_script_preflight_worker(path)
 
-    assert result.ok is True
-    assert result.errors == ()
-    assert result.wall_s >= 0.0
+    assert exit_code == 0
+    assert result == {"ok": True}
 
 
 def test_script_preflight_accepts_the_editable_starter():
     """HAR-1, CON-8: the shipped starter obeys the isolated policy contract."""
-    from aisle.harness.script_preflight import preflight_script
+    exit_code, result, _ = _run_script_preflight_worker(Path("baselines/script_s1/starter.py"))
 
-    result = preflight_script(Path("baselines/script_s1/starter.py"))
+    assert exit_code == 0
+    assert result == {"ok": True}
 
-    assert result.ok is True
-    assert result.errors == ()
+
+def test_script_preflight_worker_uses_the_required_isolated_module_argv(tmp_path: Path):
+    """HAR-1, CON-8: preflight invokes its worker via the fixed isolated module form."""
+    from aisle.harness.script_preflight import _worker_command
+
+    path = tmp_path / "candidate.py"
+
+    assert _worker_command(path) == [
+        sys.executable,
+        "-I",
+        "-m",
+        "aisle.harness.script_preflight_worker",
+        str(path.resolve()),
+    ]
+
+
+def test_script_preflight_accepts_policy_stdout_noise(tmp_path: Path):
+    """HAR-1, CON-8: candidate prints cannot corrupt the worker's JSON result."""
+    path = tmp_path / "candidate.py"
+    path.write_text(
+        "from baselines.script_s1.contract import PolicyCommand\n"
+        "print('import-noise')\n"
+        "class Policy:\n"
+        "    def on_event(self, event):\n"
+        "        print('event-noise')\n"
+        "        return [PolicyCommand('nav_goal', {})]\n"
+        "def create_policy(seed):\n"
+        "    print('factory-noise')\n"
+        "    return Policy()\n"
+    )
+
+    exit_code, result, output = _run_script_preflight_worker(path)
+
+    assert exit_code == 0
+    assert result == {"ok": True}
+    assert output == '{"ok":true}\n'

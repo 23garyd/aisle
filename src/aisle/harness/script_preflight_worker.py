@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 
@@ -58,21 +60,25 @@ def main(argv: list[str] | None = None) -> int:
         _result(False, "SCRIPT_SYNTAX")
         return 1
     try:
-        module = _load_policy(path)
+        with redirect_stdout(StringIO()):
+            module = _load_policy(path)
     except Exception:
         _result(False, "SCRIPT_IMPORT")
         return 1
 
-    factory = getattr(module, "create_policy", None)
+    with redirect_stdout(StringIO()):
+        factory = getattr(module, "create_policy", None)
     if not callable(factory):
         _result(False, "FACTORY_MISSING")
         return 1
     try:
-        policy = factory(0)
+        with redirect_stdout(StringIO()):
+            policy = factory(0)
     except Exception:
         _result(False, "POLICY_INVALID")
         return 1
-    handler = getattr(policy, "on_event", None)
+    with redirect_stdout(StringIO()):
+        handler = getattr(policy, "on_event", None)
     if not callable(handler):
         _result(False, "POLICY_INVALID")
         return 1
@@ -80,7 +86,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from baselines.script_s1.contract import PolicyEvent
 
-        commands = handler(PolicyEvent("episode_goal", {}, 0))
+        with redirect_stdout(StringIO()):
+            commands = handler(PolicyEvent("episode_goal", {}, 0))
     except ValueError:
         _result(False, "COMMAND_INVALID")
         return 1

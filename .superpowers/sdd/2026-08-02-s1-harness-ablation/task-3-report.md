@@ -90,3 +90,34 @@ worktree-resolution condition.
 - Kept changes limited to the task-3 files and focused tests; no frozen files,
   specs, environment files, simulators, dora processes, or experiment sessions
   were changed or started.
+
+## Fix Round 1
+
+Addressed both review findings with a second RED-to-GREEN cycle.
+
+- Added an exact command-construction test. RED failed because the old argv
+  used `-c`; GREEN asserts the literal required argv:
+  `[sys.executable, "-I", "-m", "aisle.harness.script_preflight_worker",
+  str(path.resolve())]`.
+- Added a candidate-noise test that prints during module import, factory
+  construction, and `on_event`. RED produced mixed output
+  (`import-noise`, `factory-noise`, `event-noise`, then JSON), which the parent
+  could not parse. GREEN verifies the worker stdout is exactly
+  `{"ok":true}\n`.
+
+Commands/results:
+
+```text
+focused RED: 2 failed, 7 passed, 15 deselected
+focused GREEN: 9 passed, 15 deselected in 0.17s
+ruff format --check .: 151 files already formatted
+ruff check .: All checks passed
+python tools/trace_check.py: ok=true, uncovered=[]
+```
+
+The exact production `-I -m` argv is now retained without a `-c`/`runpy`
+fallback. In this no-sync shared editable environment, executing that argv
+from this worktree resolves `aisle` at the main checkout rather than the
+worktree, so the focused tests exercise worker behavior directly and assert
+the production argv separately. No environment, parent checkout, or driver
+was modified to mask that worktree-only limitation.

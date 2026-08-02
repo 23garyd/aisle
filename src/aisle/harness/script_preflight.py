@@ -17,15 +17,14 @@ _KNOWN_CODES = frozenset(
 
 
 def _worker_command(path: Path) -> list[str]:
-    """Build an isolated launcher that resolves only this worktree's worker."""
-    source_root = Path(__file__).resolve().parents[2]
-    launcher = (
-        "import runpy,sys; "
-        f"sys.path.insert(0, {str(source_root)!r}); "
-        "sys.argv=['aisle.harness.script_preflight_worker', sys.argv[1]]; "
-        "runpy.run_module('aisle.harness.script_preflight_worker', run_name='__main__')"
-    )
-    return [sys.executable, "-I", "-c", launcher, str(path.resolve())]
+    """Build the fixed, isolated module invocation for a candidate policy."""
+    return [
+        sys.executable,
+        "-I",
+        "-m",
+        "aisle.harness.script_preflight_worker",
+        str(path.resolve()),
+    ]
 
 
 def _failure(code: str, started: float) -> PreflightResult:
