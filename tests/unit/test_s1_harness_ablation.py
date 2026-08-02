@@ -105,3 +105,22 @@ def test_session_ledger_is_canonical_hash_chained_and_tamper_evident(tmp_path: P
     path.write_text("\n".join(lines) + "\n")
 
     assert verify_ledger(path) == (False, None)
+
+
+def test_ledger_rejects_nonfinite_event_values(tmp_path: Path):
+    """CON-5: ledger events remain valid interoperable JSON."""
+    from aisle.harness.ablation import append_ledger
+
+    with pytest.raises(ValueError, match="Out of range float values"):
+        append_ledger(tmp_path / "session.jsonl", {"value": float("nan")})
+
+
+def test_ledger_invalid_utf8_tampering_returns_invalid_result(tmp_path: Path):
+    """CON-5: byte-level ledger tampering cannot escape verification."""
+    from aisle.harness.ablation import append_ledger, verify_ledger
+
+    path = tmp_path / "session.jsonl"
+    append_ledger(path, {"kind": "session_start"})
+    path.write_bytes(b"\xff")
+
+    assert verify_ledger(path) == (False, None)

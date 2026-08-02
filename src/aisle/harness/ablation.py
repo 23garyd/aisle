@@ -55,7 +55,7 @@ def sha256_file(path: Path) -> str:
 
 
 def _canonical_json(value: object) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def _ledger_hash(seq: int, prev_sha256: str | None, event: dict) -> str:
@@ -131,7 +131,7 @@ def verify_ledger(path: Path) -> tuple[bool, str | None]:
         return True, None
     try:
         return _parse_ledger(path.read_text(encoding="utf-8").splitlines())
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return False, None
 
 
