@@ -12,10 +12,11 @@ harness engineering rather than whether either treatment can solve S1.
 Condition A (AISLE) gives the coding agent typed dora nodes and graph,
 capability registry, graph validation, per-node Arrow traces, structured
 failure taxonomy, hot swap, skill registration, frozen reset/verifier/
-environment/safety guard, and an experiment ledger. Condition B (Script) gives
+environment/budget guard, and an experiment ledger. Condition B (Script) gives
 one editable Python policy, documented callable robot APIs, Python syntax and
 import preflight, structured application event logs, reusable Python helpers,
-and that same frozen reset, verifier, environment, and external safety guard.
+and that same frozen reset, verifier, environment, and budget guard. The budget
+guard is frozen and identical across both arms.
 Both arms receive identical observations, robot-command authority, verifier
 outcomes, videos, failure classes, and safety enforcement. The script baseline
 must receive reasonable diagnostics and must not be intentionally blinded or
