@@ -2678,6 +2678,28 @@ def _fixture_agent_destination(repo: Path, name: str = "s1-fixture") -> Path:
     return repo.parents[1] / ".s1-agent-environments" / name
 
 
+@pytest.mark.parametrize("layout", ["controller-root", "nested-under-session"])
+def test_agent_environment_rejects_repo_outside_exact_worktree_layout(tmp_path: Path, layout: str):
+    """CON-7: repository authority is exactly one direct controller .worktrees child."""
+    from tools import build_s1_agent_env as builder
+
+    if layout == "controller-root":
+        repo = tmp_path / "controller"
+    else:
+        repo = tmp_path / "controller" / ".worktrees" / "session" / "nested"
+    repo.mkdir(parents=True)
+    (repo / "uv.lock").write_bytes(b"fixture-lock\n")
+    destination = repo / ".s1-agent-environments" / "s1"
+
+    def forbidden_runner(command, *, cwd, env):
+        raise AssertionError("runner must not accept a repo outside the exact trusted layout")
+
+    result = builder.build_agent_environment(repo, destination, runner=forbidden_runner)
+
+    assert result == {"code": "INVALID_ARGUMENT", "ok": False}
+    assert not destination.exists()
+
+
 def test_agent_environment_sync_targets_only_explicit_isolated_destination(
     tmp_path: Path, monkeypatch
 ):
@@ -2997,6 +3019,73 @@ def test_agent_environment_reuse_rechecks_lock_before_returning(tmp_path: Path, 
     assert len(tuple((destination.parent / ".s1-agent-env-quarantine").iterdir())) == 1
 
 
+def test_agent_environment_inventory_failure_with_lock_mutation_prefers_lock_drift(
+    tmp_path: Path, monkeypatch
+):
+    """CON-5, CON-7: lock drift overrides a simultaneous inspection-stage failure."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = _fixture_agent_destination(repo)
+
+    def fake_runner(command, *, cwd, env):
+        _fixture_agent_environment(destination)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    def failing_inspection(path):
+        (repo / "uv.lock").write_bytes(b"mutated-during-inspection-failure\n")
+        raise builder.AgentEnvironmentError("INVENTORY_MALFORMED", "fixture inspection failure")
+
+    monkeypatch.setattr(builder, "inspect_agent_environment", failing_inspection)
+
+    result = builder.build_agent_environment(repo, destination, runner=fake_runner)
+
+    assert result == {"code": "LOCK_DRIFT", "ok": False}
+    assert not destination.exists()
+    assert len(tuple((destination.parent / ".s1-agent-env-quarantine").iterdir())) == 1
+
+
+@pytest.mark.parametrize("failing_stage", ["provenance", "manifest"])
+def test_agent_environment_attestation_failure_with_lock_mutation_prefers_lock_drift(
+    tmp_path: Path, monkeypatch, failing_stage: str
+):
+    """CON-5, CON-7: lock drift overrides provenance and manifest I/O failures."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = _fixture_agent_destination(repo)
+
+    def fake_runner(command, *, cwd, env):
+        _fixture_agent_environment(destination)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        builder,
+        "_read_distribution_inventory",
+        lambda python: ("aisle==0.1.0", "pytest==9.0.0"),
+    )
+    if failing_stage == "provenance":
+
+        def failing_provenance(destination, spec, lock_sha256):
+            (repo / "uv.lock").write_bytes(b"mutated-during-provenance-failure\n")
+            raise OSError("fixture provenance failure")
+
+        monkeypatch.setattr(builder, "_provenance", failing_provenance)
+    else:
+
+        def failing_manifest(destination, provenance):
+            (repo / "uv.lock").write_bytes(b"mutated-during-manifest-failure\n")
+            raise OSError("fixture manifest failure")
+
+        monkeypatch.setattr(builder, "_write_manifest", failing_manifest)
+
+    result = builder.build_agent_environment(repo, destination, runner=fake_runner)
+
+    assert result == {"code": "LOCK_DRIFT", "ok": False}
+    assert not destination.exists()
+    assert len(tuple((destination.parent / ".s1-agent-env-quarantine").iterdir())) == 1
+
+
 def test_agent_environment_inventory_drift_is_quarantined_before_rebuild(
     tmp_path: Path, monkeypatch
 ):
@@ -3142,6 +3231,75 @@ def test_agent_environment_requires_controller_owned_destination_parent(
     result = builder.build_agent_environment(repo, destination, runner=forbidden_runner)
 
     assert result == {"code": "DESTINATION_NOT_OWNED", "ok": False}
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o777])
+def test_agent_environment_rejects_group_or_world_writable_agent_root(tmp_path: Path, mode: int):
+    """CON-7: a shared-writable agent root cannot grant build or quarantine authority."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = _fixture_agent_destination(repo)
+    destination.parent.mkdir()
+    destination.parent.chmod(mode)
+
+    def forbidden_runner(command, *, cwd, env):
+        raise AssertionError("runner must not use a shared-writable agent root")
+
+    result = builder.build_agent_environment(repo, destination, runner=forbidden_runner)
+
+    assert result == {"code": "DESTINATION_NOT_OWNED", "ok": False}
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("quarantine_kind", ["symlink", "mode-770", "mode-777"])
+def test_agent_environment_unsafe_quarantine_root_preserves_drifted_destination(
+    tmp_path: Path, monkeypatch, quarantine_kind: str
+):
+    """CON-7: quarantine never follows aliases or writes through shared-writable roots."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = _fixture_agent_destination(repo)
+    sync_calls = 0
+
+    def fake_runner(command, *, cwd, env):
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls > 1:
+            raise AssertionError("unsafe quarantine must stop before another sync")
+        _fixture_agent_environment(destination)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        builder,
+        "_read_distribution_inventory",
+        lambda python: ("aisle==0.1.0", "pytest==9.0.0"),
+    )
+    assert builder.build_agent_environment(repo, destination, runner=fake_runner)["ok"] is True
+    drift_marker = destination / "drift-marker"
+    drift_marker.write_text("preserve me")
+    drifted_executable = destination / "bin" / "ruff"
+    drifted_executable.write_text("#!/agent-env/bin/python\n")
+    drifted_executable.chmod(drifted_executable.stat().st_mode | stat.S_IXUSR)
+    quarantine = destination.parent / ".s1-agent-env-quarantine"
+    external = tmp_path / "external-quarantine-target"
+    if quarantine_kind == "symlink":
+        external.mkdir()
+        quarantine.symlink_to(external, target_is_directory=True)
+    else:
+        quarantine.mkdir()
+        quarantine.chmod(0o770 if quarantine_kind == "mode-770" else 0o777)
+
+    result = builder.build_agent_environment(repo, destination, runner=fake_runner)
+
+    assert result == {"code": "QUARANTINE_FAILED", "ok": False}
+    assert sync_calls == 1
+    assert destination.is_dir()
+    assert drift_marker.read_text() == "preserve me"
+    if quarantine_kind == "symlink":
+        assert quarantine.is_symlink()
+        assert tuple(external.iterdir()) == ()
 
 
 def test_agent_environment_sync_and_inventory_failures_have_stable_codes(

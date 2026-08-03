@@ -31,6 +31,7 @@ _FORBIDDEN_DISTRIBUTIONS = frozenset({"genesis-world", "dora-rs", "torch"})
 _FORBIDDEN_EXECUTABLES = frozenset({"dora", "genesis"})
 _AGENT_ENV_ROOT_NAME = ".s1-agent-environments"
 _ENVIRONMENT_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_SHARED_WRITE_MASK = stat.S_IWGRP | stat.S_IWOTH
 
 
 @dataclass(frozen=True)
@@ -240,17 +241,58 @@ def _provenance(destination: Path, spec: AgentEnvironmentSpec, lock_sha256: str)
     return {**identity, "inventory_sha256": _sha256_json(identity)}
 
 
+def _secure_directory(
+    path: Path,
+    expected_parent: Path,
+    *,
+    create: bool,
+    code: str,
+) -> bool:
+    if path.parent != expected_parent or path.resolve(strict=False) != path:
+        raise AgentEnvironmentError(code, "directory is outside its canonical trusted parent")
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        if not create:
+            return False
+        try:
+            path.mkdir(mode=0o700, parents=False, exist_ok=False)
+            path_stat = path.lstat()
+        except OSError as error:
+            raise AgentEnvironmentError(code, "could not create private directory") from error
+    except OSError as error:
+        raise AgentEnvironmentError(code, "could not inspect private directory") from error
+    if (
+        not stat.S_ISDIR(path_stat.st_mode)
+        or path_stat.st_uid != os.getuid()
+        or stat.S_IMODE(path_stat.st_mode) & _SHARED_WRITE_MASK
+    ):
+        raise AgentEnvironmentError(
+            code, "directory must be canonical, controller-owned, and not shared-writable"
+        )
+    return True
+
+
 def _validate_build_paths(repo: Path, destination: Path) -> tuple[Path, Path, Path]:
     if not repo.is_absolute() or not destination.is_absolute():
         raise AgentEnvironmentError(
             "INVALID_ARGUMENT", "repo and destination must be explicit absolute paths"
         )
+    requested_repo = repo
     requested_destination = destination
     repo = repo.resolve(strict=True)
     destination = requested_destination.resolve(strict=False)
-    if not repo.is_dir():
-        raise AgentEnvironmentError("INVALID_ARGUMENT", "repo must be a directory")
-    controller_root = repo.parent.parent if repo.parent.name == ".worktrees" else repo
+    if (
+        requested_repo != repo
+        or not repo.is_dir()
+        or repo.parent.name != ".worktrees"
+        or repo.parent.parent == repo.parent
+    ):
+        raise AgentEnvironmentError(
+            "INVALID_ARGUMENT",
+            "repo must be one canonical direct child of controller .worktrees",
+        )
+    controller_root = repo.parent.parent
     worktrees_root = controller_root / ".worktrees"
     agent_environment_root = controller_root / _AGENT_ENV_ROOT_NAME
     if (
@@ -278,18 +320,21 @@ def _validate_build_paths(repo: Path, destination: Path) -> tuple[Path, Path, Pa
                 "DESTINATION_NOT_ISOLATED",
                 "destination cannot be the active host UV_PROJECT_ENVIRONMENT",
             )
-    ownership_boundary = (
-        agent_environment_root if agent_environment_root.exists() else controller_root
-    )
     if (
-        ownership_boundary.is_symlink()
-        or not ownership_boundary.is_dir()
-        or ownership_boundary.stat().st_uid != os.getuid()
+        not controller_root.is_dir()
+        or controller_root.is_symlink()
+        or controller_root.stat().st_uid != os.getuid()
     ):
         raise AgentEnvironmentError(
             "DESTINATION_NOT_OWNED",
-            "dedicated agent-environment root must be controller-owned",
+            "controller root must be canonical and controller-owned",
         )
+    _secure_directory(
+        agent_environment_root,
+        controller_root,
+        create=False,
+        code="DESTINATION_NOT_OWNED",
+    )
     lock = repo / "uv.lock"
     if not lock.is_file():
         raise AgentEnvironmentError("LOCK_MISSING", "repository uv.lock is unavailable")
@@ -298,17 +343,12 @@ def _validate_build_paths(repo: Path, destination: Path) -> tuple[Path, Path, Pa
 
 def _prepare_agent_environment_root(destination: Path) -> None:
     root = destination.parent
-    try:
-        root.mkdir(mode=0o700, exist_ok=True)
-        root_stat = root.stat()
-    except OSError as error:
-        raise AgentEnvironmentError(
-            "DESTINATION_NOT_OWNED", "could not create dedicated agent-environment root"
-        ) from error
-    if root.is_symlink() or not root.is_dir() or root_stat.st_uid != os.getuid():
-        raise AgentEnvironmentError(
-            "DESTINATION_NOT_OWNED", "dedicated agent-environment root is not controller-owned"
-        )
+    _secure_directory(
+        root,
+        root.parent,
+        create=True,
+        code="DESTINATION_NOT_OWNED",
+    )
 
 
 def _write_manifest(destination: Path, provenance: dict) -> None:
@@ -334,15 +374,34 @@ def _read_manifest(destination: Path) -> tuple[dict | None, bytes]:
 
 
 def _quarantine_destination(destination: Path, evidence: bytes) -> str | None:
-    quarantine_root = destination.parent / ".s1-agent-env-quarantine"
+    agent_environment_root = destination.parent
+    controller_root = agent_environment_root.parent
+    quarantine_root = agent_environment_root / ".s1-agent-env-quarantine"
     tag_source = evidence or str(destination).encode()
     tag = hashlib.sha256(tag_source).hexdigest()[:16]
     target = quarantine_root / f"{destination.name}-{tag}"
     try:
-        quarantine_root.mkdir(parents=False, exist_ok=True)
+        _secure_directory(
+            agent_environment_root,
+            controller_root,
+            create=False,
+            code="QUARANTINE_FAILED",
+        )
+        _secure_directory(
+            quarantine_root,
+            agent_environment_root,
+            create=True,
+            code="QUARANTINE_FAILED",
+        )
+    except AgentEnvironmentError:
+        return "QUARANTINE_FAILED"
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        pass
     except OSError:
         return "QUARANTINE_FAILED"
-    if target.exists():
+    else:
         return "QUARANTINE_CONFLICT"
     try:
         destination.replace(target)
@@ -359,11 +418,26 @@ def _lock_matches(lock: Path, expected_sha256: str) -> bool:
 
 
 def _lock_drift_result(destination: Path, lock_sha256: str) -> dict:
-    if destination.exists():
-        _, manifest_bytes = _read_manifest(destination)
-        evidence = manifest_bytes or f"lock-drift:{lock_sha256}".encode()
-        _quarantine_destination(destination, evidence)
+    try:
+        destination.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+    else:
+        _quarantine_destination(destination, f"lock-drift:{lock_sha256}".encode())
     return {"code": "LOCK_DRIFT", "ok": False}
+
+
+def _failure_result(
+    code: str,
+    lock: Path,
+    lock_sha256: str,
+    destination: Path,
+) -> dict:
+    if not _lock_matches(lock, lock_sha256):
+        return _lock_drift_result(destination, lock_sha256)
+    return {"code": code, "ok": False}
 
 
 def build_agent_environment(repo: Path, destination: Path, *, runner: Callable) -> dict:
@@ -394,7 +468,7 @@ def build_agent_environment(repo: Path, destination: Path, *, runner: Callable) 
             return {"ok": True, "reused": True, **current_provenance}
         quarantine_error = _quarantine_destination(destination, manifest_bytes)
         if quarantine_error is not None:
-            return {"code": quarantine_error, "ok": False}
+            return _failure_result(quarantine_error, lock, lock_sha256, destination)
 
     if not _lock_matches(lock, lock_sha256):
         return _lock_drift_result(destination, lock_sha256)
@@ -404,25 +478,25 @@ def build_agent_environment(repo: Path, destination: Path, *, runner: Callable) 
     try:
         completed = runner(command, cwd=repo, env=environment)
     except OSError:
-        return {"code": "SYNC_FAILED", "ok": False}
+        return _failure_result("SYNC_FAILED", lock, lock_sha256, destination)
     if not _lock_matches(lock, lock_sha256):
         return _lock_drift_result(destination, lock_sha256)
     if type(getattr(completed, "returncode", None)) is not int or completed.returncode != 0:
-        return {"code": "SYNC_FAILED", "ok": False}
+        return _failure_result("SYNC_FAILED", lock, lock_sha256, destination)
 
     try:
         inspected = inspect_agent_environment(destination)
     except AgentEnvironmentError as error:
-        return {"code": error.code, "ok": False}
+        return _failure_result(error.code, lock, lock_sha256, destination)
     except OSError:
-        return {"code": "INVENTORY_MALFORMED", "ok": False}
+        return _failure_result("INVENTORY_MALFORMED", lock, lock_sha256, destination)
     if not _lock_matches(lock, lock_sha256):
         return _lock_drift_result(destination, lock_sha256)
     try:
         provenance = _provenance(destination, inspected, lock_sha256)
         _write_manifest(destination, provenance)
     except OSError:
-        return {"code": "INVENTORY_MALFORMED", "ok": False}
+        return _failure_result("INVENTORY_MALFORMED", lock, lock_sha256, destination)
     if not _lock_matches(lock, lock_sha256):
         return _lock_drift_result(destination, lock_sha256)
 
