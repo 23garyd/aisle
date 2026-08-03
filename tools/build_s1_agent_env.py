@@ -477,7 +477,7 @@ def build_agent_environment(repo: Path, destination: Path, *, runner: Callable) 
     command = ["uv", "sync", "--frozen", "--no-extra", "sim", "--group", "dev"]
     try:
         completed = runner(command, cwd=repo, env=environment)
-    except OSError:
+    except Exception:  # noqa: BLE001 - normalize runner failures; never catch BaseException
         return _failure_result("SYNC_FAILED", lock, lock_sha256, destination)
     if not _lock_matches(lock, lock_sha256):
         return _lock_drift_result(destination, lock_sha256)

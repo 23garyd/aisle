@@ -3327,6 +3327,17 @@ def test_agent_environment_sync_and_inventory_failures_have_stable_codes(
         "ok": False,
     }
 
+    def runtime_failure(command, *, cwd, env):
+        raise RuntimeError("fixture secret\nmust not enter JSON")
+
+    runtime_result = builder.build_agent_environment(
+        repo,
+        destination,
+        runner=runtime_failure,
+    )
+    assert runtime_result == {"code": "SYNC_FAILED", "ok": False}
+    assert "fixture secret" not in json.dumps(runtime_result)
+
     def malformed_runner(command, *, cwd, env):
         _fixture_agent_environment(destination)
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -3340,6 +3351,31 @@ def test_agent_environment_sync_and_inventory_failures_have_stable_codes(
         "code": "INVENTORY_MALFORMED",
         "ok": False,
     }
+
+
+def test_agent_environment_runtime_runner_failure_with_lock_drift_is_quarantined(
+    tmp_path: Path,
+):
+    """CON-5, CON-7: ordinary runner exceptions cannot bypass lock-drift preservation."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = _fixture_agent_destination(repo)
+
+    def failing_runner(command, *, cwd, env):
+        _fixture_agent_environment(destination)
+        (destination / "partial-sync").write_text("preserve me")
+        (repo / "uv.lock").write_bytes(b"mutated-before-runtime-error\n")
+        raise RuntimeError("fixture runner secret\nmust not enter JSON")
+
+    result = builder.build_agent_environment(repo, destination, runner=failing_runner)
+
+    assert result == {"code": "LOCK_DRIFT", "ok": False}
+    assert "fixture runner secret" not in json.dumps(result)
+    assert not destination.exists()
+    quarantined = tuple((destination.parent / ".s1-agent-env-quarantine").iterdir())
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "partial-sync").read_text() == "preserve me"
 
 
 @pytest.mark.parametrize(
