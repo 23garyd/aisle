@@ -1,6 +1,7 @@
 """Unit tests for the S1 harness-versus-script neutral attempt schema."""
 
 import json
+import os
 import shutil
 import signal
 import subprocess
@@ -2650,3 +2651,413 @@ def test_controller_help_is_one_success_json_object(argv: list[str]):
     assert response["ok"] is True
     assert isinstance(response["usage"], dict)
     assert stdout.getvalue().count("\n") == 1
+
+
+def _native_sandbox_policy(tmp_path: Path, *, agent_name: str = "claude"):
+    from aisle.harness.native_sandbox import SandboxPolicy
+
+    worktree = tmp_path / "assigned-session-worktree"
+    agent_env = tmp_path / "minimal-agent-environment"
+    runtime_dir = tmp_path / "private-attempt-runtime"
+    client = tmp_path / "immutable-attempt-client"
+    executable = tmp_path / f"selected-{agent_name}"
+    credentials = tmp_path / f".{agent_name}-credentials"
+    for directory in (worktree, agent_env, runtime_dir, credentials):
+        directory.mkdir()
+    runtime_dir.chmod(0o700)
+    client.write_text("#!/agent-env/bin/python\n")
+    executable.write_text("#!/bin/sh\n")
+    return SandboxPolicy(
+        worktree=worktree,
+        agent_env=agent_env,
+        runtime_dir=runtime_dir,
+        attempt_client=client,
+        agent_executable=executable,
+        credential_mounts=(credentials,),
+    )
+
+
+def _bwrap_mounts(argv: list[str], option: str) -> list[tuple[str, str]]:
+    return [
+        (argv[index + 1], argv[index + 2]) for index, value in enumerate(argv) if value == option
+    ]
+
+
+def test_native_sandbox_builds_an_explicit_minimal_namespace(tmp_path: Path):
+    """CON-5: the native isolation policy produces deterministic, explicit bwrap argv."""
+    from aisle.harness.native_sandbox import build_bwrap_argv
+
+    policy = _native_sandbox_policy(tmp_path)
+    argv = build_bwrap_argv(
+        policy,
+        ["/opt/aisle/agent", "--version"],
+        {
+            "ANTHROPIC_API_KEY": "fixture-anthropic-key",
+            "HTTPS_PROXY": "http://fixture-proxy.invalid",
+            "LANG": "C.UTF-8",
+            "SSL_CERT_FILE": "/fixture/cert.pem",
+            "UNRELATED_HOST_SECRET": "must-not-cross",
+        },
+    )
+
+    assert Path(argv[0]).name == "bwrap"
+    for flag in (
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--clearenv",
+    ):
+        assert argv.count(flag) == 1
+    assert ("--proc", "/proc") in zip(argv, argv[1:], strict=False)
+    assert ("--dev", "/dev") in zip(argv, argv[1:], strict=False)
+    assert argv[-3:] == ["--", "/opt/aisle/agent", "--version"]
+
+    writable = _bwrap_mounts(argv, "--bind")
+    readonly = _bwrap_mounts(argv, "--ro-bind")
+    assert writable == [(str(policy.worktree.resolve()), "/workspace")]
+    assert (str(policy.agent_env.resolve()), "/agent-env") in readonly
+    assert (str(policy.runtime_dir.resolve()), "/run/aisle") in readonly
+    assert (str(policy.attempt_client.resolve()), "/opt/aisle/attempt-client") in readonly
+    assert (str(policy.agent_executable.resolve()), "/opt/aisle/agent") in readonly
+    assert (
+        str(policy.credential_mounts[0].resolve()),
+        f"/agent-home/{policy.credential_mounts[0].name}",
+    ) in readonly
+    assert any(destination in {"/lib", "/usr/lib"} for _, destination in readonly)
+    assert any(destination.startswith("/etc/") for _, destination in readonly)
+    mounted_sources = {Path(source) for source, _ in writable + readonly}
+    assert not mounted_sources & {
+        Path("/dev/nvidia0"),
+        Path("/dev/nvidiactl"),
+        Path("/var/run/docker.sock"),
+        Path("/run/docker.sock"),
+        Path("/run/containerd/containerd.sock"),
+        REPO_ROOT,
+        REPO_ROOT.parent,
+        REPO_ROOT.parent.parent / ".venv",
+    }
+    assert ("--tmpfs", "/tmp") in zip(argv, argv[1:], strict=False)
+    assert ("--tmpfs", "/agent-home") in zip(argv, argv[1:], strict=False)
+
+    setenv = {
+        argv[index + 1]: argv[index + 2] for index, value in enumerate(argv) if value == "--setenv"
+    }
+    assert setenv == {
+        "AISLE_ABLATION_CLIENT": "/opt/aisle/attempt-client",
+        "AISLE_ABLATION_SOCKET": "/run/aisle/attempt.sock",
+        "ANTHROPIC_API_KEY": "fixture-anthropic-key",
+        "HOME": "/agent-home",
+        "HTTPS_PROXY": "http://fixture-proxy.invalid",
+        "LANG": "C.UTF-8",
+        "PATH": "/agent-env/bin:/usr/bin:/bin",
+        "PYTHONNOUSERSITE": "1",
+        "SSL_CERT_FILE": "/fixture/cert.pem",
+    }
+    assert "UNRELATED_HOST_SECRET" not in argv
+
+
+def test_native_sandbox_policy_is_deeply_immutable(tmp_path: Path):
+    """CON-5: sandbox mount authority cannot drift after policy construction."""
+    from dataclasses import FrozenInstanceError
+
+    policy = _native_sandbox_policy(tmp_path)
+
+    with pytest.raises(FrozenInstanceError):
+        policy.worktree = tmp_path / "replacement"
+    assert isinstance(policy.credential_mounts, tuple)
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        Path("/dev/nvidia0"),
+        Path("/dev/nvidiactl"),
+        Path("/var/run/docker.sock"),
+        Path("/run/docker.sock"),
+        Path("/run/containerd/containerd.sock"),
+    ],
+)
+def test_native_sandbox_rejects_forbidden_bind_sources(tmp_path: Path, forbidden: Path):
+    """Native isolation design: GPU and container-control paths fail closed."""
+    from dataclasses import replace
+
+    from aisle.harness.native_sandbox import build_bwrap_argv
+
+    policy = replace(_native_sandbox_policy(tmp_path), credential_mounts=(forbidden,))
+
+    with pytest.raises(ValueError, match="forbidden"):
+        build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
+
+
+@pytest.mark.parametrize(
+    "forbidden_ancestor",
+    [
+        Path("/dev"),
+        Path("/run"),
+        Path("/var/run"),
+        Path("/proc"),
+        Path("/sys"),
+    ],
+)
+def test_native_sandbox_rejects_pseudofs_and_forbidden_ancestors(
+    tmp_path: Path, forbidden_ancestor: Path
+):
+    """Native isolation design: alternate mounts cannot restore host devices or processes."""
+    from dataclasses import replace
+
+    from aisle.harness.native_sandbox import build_bwrap_argv
+
+    policy = replace(_native_sandbox_policy(tmp_path), credential_mounts=(forbidden_ancestor,))
+
+    with pytest.raises(ValueError, match="forbidden"):
+        build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
+
+
+@pytest.mark.parametrize(
+    "protected_source",
+    [
+        REPO_ROOT,
+        REPO_ROOT.parent,
+        REPO_ROOT.parent.parent / ".venv",
+    ],
+)
+def test_native_sandbox_rejects_controller_worktree_parent_and_host_venv(
+    tmp_path: Path, protected_source: Path
+):
+    """CON-7: trusted controller, sibling-worktree parent, and simulation env stay hidden."""
+    from dataclasses import replace
+
+    from aisle.harness.native_sandbox import build_bwrap_argv
+
+    policy = replace(_native_sandbox_policy(tmp_path), credential_mounts=(protected_source,))
+
+    with pytest.raises(ValueError, match="protected"):
+        build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
+
+
+def test_native_sandbox_allows_one_assigned_leaf_under_worktrees_root(tmp_path: Path, monkeypatch):
+    """Native isolation design: the assigned leaf is writable while its parent stays hidden."""
+    from dataclasses import replace
+
+    from aisle.harness import native_sandbox
+
+    repository = tmp_path / "trusted-repository"
+    worktrees_root = repository / ".worktrees"
+    assigned = worktrees_root / "assigned-session"
+    assigned.mkdir(parents=True)
+    host_venv = repository / ".venv"
+    host_venv.mkdir()
+    monkeypatch.setattr(native_sandbox, "_CONTROLLER_ROOT", repository)
+    monkeypatch.setattr(native_sandbox, "_WORKTREES_ROOT", worktrees_root)
+    monkeypatch.setattr(native_sandbox, "_HOST_SIMULATION_ENV", host_venv)
+    monkeypatch.setattr(
+        native_sandbox,
+        "_PROTECTED_SOURCES",
+        (repository, worktrees_root, host_venv),
+    )
+    policy = replace(_native_sandbox_policy(tmp_path), worktree=assigned)
+
+    argv = native_sandbox.build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
+
+    assert (str(assigned.resolve()), "/workspace") in _bwrap_mounts(argv, "--bind")
+    assert all(
+        Path(source) not in {repository.resolve(), worktrees_root.resolve()}
+        for source, _ in _bwrap_mounts(argv, "--ro-bind")
+    )
+
+
+@pytest.mark.parametrize("relative_worktree", [Path("src"), Path(".worktrees/session/nested")])
+def test_native_sandbox_rejects_controller_and_nested_worktree_paths(
+    tmp_path: Path, monkeypatch, relative_worktree: Path
+):
+    """CON-7: the writable exception cannot select controller source or a nested subtree."""
+    from dataclasses import replace
+
+    from aisle.harness import native_sandbox
+
+    repository = tmp_path / "trusted-repository"
+    worktrees_root = repository / ".worktrees"
+    host_venv = repository / ".venv"
+    candidate = repository / relative_worktree
+    for directory in (worktrees_root, host_venv, candidate):
+        directory.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(native_sandbox, "_CONTROLLER_ROOT", repository)
+    monkeypatch.setattr(native_sandbox, "_WORKTREES_ROOT", worktrees_root)
+    monkeypatch.setattr(native_sandbox, "_HOST_SIMULATION_ENV", host_venv)
+    monkeypatch.setattr(
+        native_sandbox,
+        "_PROTECTED_SOURCES",
+        (repository, worktrees_root, host_venv),
+    )
+    policy = replace(_native_sandbox_policy(tmp_path), worktree=candidate)
+
+    with pytest.raises(ValueError, match="protected"):
+        native_sandbox.build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
+
+
+def test_native_sandbox_requires_private_uid_owned_runtime(tmp_path: Path, monkeypatch):
+    """Native isolation design: socket runtime ownership and mode are fail-closed."""
+    from aisle.harness.native_sandbox import build_bwrap_argv
+
+    policy = _native_sandbox_policy(tmp_path)
+    policy.runtime_dir.chmod(0o755)
+    with pytest.raises(ValueError, match="0700"):
+        build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
+
+    policy.runtime_dir.chmod(0o700)
+    monkeypatch.setattr("aisle.harness.native_sandbox.os.getuid", lambda: -1)
+    with pytest.raises(ValueError, match="current uid"):
+        build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
+
+
+@pytest.mark.parametrize("source_field", ["runtime_dir", "attempt_client"])
+def test_native_sandbox_keeps_socket_and_client_outside_writable_worktree(
+    tmp_path: Path, source_field: str
+):
+    """Native isolation design: broker authority cannot live in agent-writable storage."""
+    from dataclasses import replace
+
+    from aisle.harness.native_sandbox import build_bwrap_argv
+
+    policy = _native_sandbox_policy(tmp_path)
+    if source_field == "runtime_dir":
+        source = policy.worktree / "runtime"
+        source.mkdir()
+        source.chmod(0o700)
+    else:
+        source = policy.worktree / "attempt-client"
+        source.write_text("immutable only outside the worktree\n")
+    policy = replace(policy, **{source_field: source})
+
+    with pytest.raises(ValueError, match="outside"):
+        build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
+
+
+@pytest.mark.parametrize("source_field", ["runtime_dir", "credential_mounts"])
+def test_native_sandbox_rejects_bind_ancestors_of_writable_worktree(
+    tmp_path: Path, source_field: str
+):
+    """Native isolation design: alternate mounts cannot reveal the worktree through an ancestor."""
+    from dataclasses import replace
+
+    from aisle.harness.native_sandbox import build_bwrap_argv
+
+    policy = _native_sandbox_policy(tmp_path)
+    tmp_path.chmod(0o700)
+    replacement = tmp_path if source_field == "runtime_dir" else (tmp_path,)
+    policy = replace(policy, **{source_field: replacement})
+
+    with pytest.raises(ValueError, match="outside"):
+        build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
+
+
+def test_native_sandbox_selects_only_matching_vendor_auth(tmp_path: Path):
+    """Native isolation design: vendor selection cannot leak another provider's credentials."""
+    from aisle.harness.native_sandbox import build_bwrap_argv
+
+    policy = _native_sandbox_policy(tmp_path, agent_name="codex")
+    argv = build_bwrap_argv(
+        policy,
+        ["/opt/aisle/agent"],
+        {
+            "OPENAI_API_KEY": "fixture-openai-key",
+            "ANTHROPIC_API_KEY": "must-not-cross",
+            "HTTP_PROXY": "http://fixture-proxy.invalid",
+        },
+    )
+
+    assert "OPENAI_API_KEY" in argv
+    assert "fixture-openai-key" in argv
+    assert "ANTHROPIC_API_KEY" not in argv
+    assert "must-not-cross" not in argv
+
+
+def _valid_native_sandbox_probe() -> dict[str, bool]:
+    return {
+        "worktree_write": True,
+        "network_dns": True,
+        "host_process_visible": False,
+        "nvidia_visible": False,
+        "docker_socket_visible": False,
+        "genesis_importable": False,
+        "dora_executable": False,
+        "other_worktree_visible": False,
+        "attempt_socket_visible": True,
+    }
+
+
+def test_native_sandbox_probe_accepts_only_the_exact_success_contract():
+    """Native isolation design: every harmless isolation probe must have its safe value."""
+    from aisle.harness.native_sandbox import verify_sandbox_probe
+
+    assert verify_sandbox_probe(_valid_native_sandbox_probe()) == (True, ())
+
+
+@pytest.mark.parametrize(
+    ("mutation", "detail"),
+    [
+        (lambda result: result.pop("network_dns"), "missing:network_dns"),
+        (lambda result: result.update({"surprise": True}), "unknown:surprise"),
+        (lambda result: result.update({1: True, "surprise": True}), "unknown:1"),
+        (lambda result: result.update({"nvidia_visible": True}), "nvidia_visible"),
+        (lambda result: result.update({"attempt_socket_visible": 1}), "attempt_socket_visible"),
+    ],
+)
+def test_native_sandbox_probe_fails_closed_on_shape_value_or_type(mutation, detail: str):
+    """Native isolation design: missing, unknown, unsafe, and truthy non-bools are rejected."""
+    from aisle.harness.native_sandbox import verify_sandbox_probe
+
+    result = _valid_native_sandbox_probe()
+    mutation(result)
+
+    ok, errors = verify_sandbox_probe(result)
+
+    assert ok is False
+    assert any(detail in error for error in errors)
+
+
+def test_native_sandbox_probe_rejects_a_non_object_result():
+    """Native isolation design: malformed probe output fails closed instead of raising."""
+    from aisle.harness.native_sandbox import verify_sandbox_probe
+
+    assert verify_sandbox_probe([]) == (False, ("result:not_object",))
+
+
+def test_native_sandbox_probe_command_is_json_only_and_harmless():
+    """CON-8: the probe command uses filesystem/import/path checks and DNS only."""
+    from aisle.harness.native_sandbox import sandbox_probe_command
+
+    command = sandbox_probe_command()
+
+    assert command[:3] == ["/agent-env/bin/python", "-I", "-c"]
+    assert len(command) == 4
+    compile(command[3], "<sandbox-probe>", "exec")
+    assert "getaddrinfo" in command[3]
+    assert "find_spec" in command[3]
+    assert "subprocess" not in command[3]
+    assert "urlopen" not in command[3]
+
+
+def test_native_sandbox_probe_distinguishes_host_pid_namespace(monkeypatch):
+    """Native isolation design: host visibility means matching trusted PID-namespace identity."""
+    from aisle.harness.native_sandbox import sandbox_probe_command
+
+    monkeypatch.setattr("socket.getaddrinfo", lambda *args, **kwargs: [])
+    host_namespace = os.stat("/proc/self/ns/pid").st_ino
+    source = sandbox_probe_command()[3]
+
+    def execute(probe_source: str) -> dict:
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            exec(compile(probe_source, "<sandbox-probe>", "exec"), {})
+        return json.loads(stdout.getvalue())
+
+    assert execute(source)["host_process_visible"] is True
+    isolated_source = source.replace(
+        f"HOST_PID_NAMESPACE = {host_namespace}",
+        f"HOST_PID_NAMESPACE = {host_namespace + 1}",
+    )
+    assert isolated_source != source
+    assert execute(isolated_source)["host_process_visible"] is False
