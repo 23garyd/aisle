@@ -50,9 +50,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # This is the fixed baseline API, never the candidate's directory.
-    root = str(_repository_root())
-    if root not in sys.path:
-        sys.path.insert(0, root)
+    repository_root = _repository_root()
+    for trusted_path in (repository_root / "src", repository_root):
+        trusted = str(trusted_path)
+        if trusted not in sys.path:
+            sys.path.insert(0, trusted)
     try:
         source = path.read_bytes()
         compile(source, str(path), "exec")

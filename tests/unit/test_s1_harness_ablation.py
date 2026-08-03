@@ -5,6 +5,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 from contextlib import redirect_stdout
 from dataclasses import replace
 from io import StringIO
@@ -1247,9 +1248,19 @@ def _controller_runtime(
             shutil.copy2(REPO_ROOT / relative, target)
         return destination
 
-    def execute(command, cwd, agent, on_line, stop_reason, wall_ceiling_s):
+    def execute(
+        command,
+        cwd,
+        agent,
+        on_line,
+        stop_reason,
+        wall_ceiling_s,
+        environment,
+    ):
         assert command and cwd.is_dir() and agent in {"claude", "codex"}
         assert wall_ceiling_s <= 4 * 3600
+        assert environment["AISLE_ABLATION_SESSION"]
+        assert environment["AISLE_ABLATION_CONTROLLER"].endswith("tools/s1_harness_ablation.py")
         try:
             for line in lines:
                 on_line(line, 0.25)
@@ -1397,6 +1408,7 @@ def test_controller_prepare_is_deterministic_paired_and_copies_only_assigned_sur
         ("--tokens", "500001"),
         ("--episodes", "41"),
         ("--wall-h", "4.0001"),
+        ("--wall-h", "nan"),
     ],
 )
 def test_controller_refuses_any_budget_above_the_frozen_ceiling(
@@ -1582,22 +1594,27 @@ def test_controller_live_stream_stops_at_token_budget_and_reserves_episode_budge
 
     returncode, response, _, _ = _run_prepared_controller_session(controller, session_dir, runtime)
 
-    assert returncode == 0
-    assert response["stopped"] == "token_budget"
+    assert returncode == 1
+    assert response["code"] == "TOKEN_BUDGET_EXCEEDED"
     assert response["tokens_spent"] == 500_000
     assert budget_remaining(session_dir / "worktree")["episodes_left"] == 40
 
 
 def test_controller_scores_unavailable_safety_evidence_fail_closed(tmp_path: Path):
     """CON-5, CON-7: INFRA_SAFETY_UNAVAILABLE is not inferred as held-out zero."""
-    from aisle.harness.ablation import AttemptResult, PreflightResult, SafetyResult
+    from aisle.harness.ablation import (
+        AttemptResult,
+        PreflightResult,
+        SafetyResult,
+        sha256_file,
+    )
     from tools import s1_harness_ablation as controller
 
     class UnavailableSafetyAdapter:
         def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
             return AttemptResult(
                 attempt_id=run_id,
-                candidate_hash="b" * 64,
+                candidate_hash=sha256_file(candidate),
                 preflight=PreflightResult(ok=True, errors=(), wall_s=0.0),
                 episodes=(_episode_record(0, 100),),
                 failures={"INFRA_SAFETY_UNAVAILABLE": 1},
@@ -1627,7 +1644,12 @@ def test_controller_scores_unavailable_safety_evidence_fail_closed(tmp_path: Pat
 
 def test_controller_scores_all_eight_heldout_seeds_and_clean_audit_passes(tmp_path: Path):
     """CON-5, CON-7: external scoring records all held-out outcomes and verified provenance."""
-    from aisle.harness.ablation import AttemptResult, PreflightResult, SafetyResult
+    from aisle.harness.ablation import (
+        AttemptResult,
+        PreflightResult,
+        SafetyResult,
+        sha256_file,
+    )
     from tools import s1_harness_ablation as controller
 
     class HeldoutAdapter:
@@ -1646,7 +1668,7 @@ def test_controller_scores_all_eight_heldout_seeds_and_clean_audit_passes(tmp_pa
                 episodes.append(episode)
             return AttemptResult(
                 attempt_id=run_id,
-                candidate_hash="c" * 64,
+                candidate_hash=sha256_file(candidate),
                 preflight=PreflightResult(ok=True, errors=(), wall_s=0.1),
                 episodes=tuple(episodes),
                 failures={"timeout": 4},
@@ -1838,3 +1860,793 @@ def test_controller_cli_emits_one_json_object_even_for_argument_errors(tmp_path:
     assert output.count("\n") == 1
     assert "usage:" not in output
     assert "usage:" not in stderr
+
+
+def test_controller_supervises_dev_attempts_through_assigned_adapter_and_correlates_audit(
+    tmp_path: Path,
+):
+    """CON-5, CON-7: controller admits, records, and settles every assigned dev attempt."""
+    from aisle.harness.ablation import (
+        AttemptResult,
+        PreflightResult,
+        SafetyResult,
+        sha256_file,
+    )
+    from tools import s1_harness_ablation as controller
+
+    adapter_calls: list[tuple[str, Path, str, str]] = []
+
+    class DevelopmentAdapter:
+        def __init__(self, condition: str):
+            self.condition = condition
+
+        def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
+            adapter_calls.append((self.condition, candidate, seeds, run_id))
+            episodes = tuple(
+                _episode_record(index, seed)
+                for index, seed in enumerate(int(value) for value in seeds.split(","))
+            )
+            return AttemptResult(
+                attempt_id=run_id,
+                candidate_hash=sha256_file(candidate),
+                preflight=PreflightResult(ok=True, errors=(), wall_s=0.1),
+                episodes=episodes,
+                failures={"timeout": len(episodes)},
+                safety=SafetyResult(ungated=0, clamps=1, extra_item=0),
+                timing={"wall_s": 1.0, "sim_s": 2.0},
+                artifacts={},
+            )
+
+    base_runtime = _controller_runtime(
+        controller,
+        adapter_factory=lambda condition, worktree: DevelopmentAdapter(condition),
+    )
+    nested_responses: list[dict] = []
+    runtime = None
+
+    def execute(command, cwd, agent, on_line, stop_reason, wall_ceiling_s, environment):
+        assert environment["AISLE_ABLATION_SESSION"]
+        assert environment["AISLE_ABLATION_CONTROLLER"].endswith("tools/s1_harness_ablation.py")
+        response = controller._attempt_client(
+            controller.argparse.Namespace(
+                session=environment["AISLE_ABLATION_SESSION"],
+                seeds="0,1",
+            ),
+            environment,
+        )
+        assert response["ok"] is True
+        nested_responses.append(response)
+        line = (
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 3,
+                            "cache_creation_input_tokens": 2,
+                            "output_tokens": 1,
+                        }
+                    },
+                }
+            )
+            + "\n"
+        )
+        on_line(line, 0.25)
+        return controller.ExecutionResult(
+            stopped="agent_done",
+            returncode=0,
+            wall_s=0.25,
+            agent_version="fixture-agent-1",
+        )
+
+    runtime = replace(base_runtime, execute_agent=execute)
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+
+    returncode, response, _, _ = _run_prepared_controller_session(controller, session_dir, runtime)
+
+    assert returncode == 0 and response["ok"] is True
+    assert nested_responses[0]["ok"] is True
+    attempt = json.loads((session_dir / "attempts.jsonl").read_text())
+    assert attempt["attempt_id"] == nested_responses[0]["attempt_id"]
+    assert [episode["seed"] for episode in attempt["episodes"]] == [0, 1]
+    session = json.loads((session_dir / "session.json").read_text())
+    assert adapter_calls == [
+        (
+            session["condition"],
+            session_dir / session["candidate"],
+            "0,1",
+            nested_responses[0]["attempt_id"],
+        )
+    ]
+    controller_manifest = (
+        session_dir
+        / "worktree"
+        / "runs"
+        / nested_responses[0]["attempt_id"]
+        / "controller_attempt.json"
+    )
+    assert controller_manifest.is_file()
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["audit", "--dir", str(session_dir)],
+        runtime,
+    )
+    assert returncode == 0
+    assert response["ok"] is True
+    assert response["sessions"][0]["development_episodes"] == 2
+
+    controller_manifest.unlink()
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["audit", "--dir", str(session_dir)],
+        runtime,
+    )
+    assert returncode == 1
+    assert "ATTEMPT_CORRELATION_INVALID" in response["sessions"][0]["issues"]
+
+
+def test_controller_attempt_channel_refuses_heldout_and_exhausted_dev_budget(tmp_path: Path):
+    """CON-7: attempt admission rejects non-dev seeds and reserves capacity before launch."""
+    from aisle.harness.ablation import (
+        AttemptResult,
+        PreflightResult,
+        SafetyResult,
+        sha256_file,
+    )
+    from tools import s1_harness_ablation as controller
+
+    launches: list[str] = []
+
+    class Adapter:
+        def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
+            launches.append(seeds)
+            seed_values = [int(value) for value in seeds.split(",")]
+            return AttemptResult(
+                attempt_id=run_id,
+                candidate_hash=sha256_file(candidate),
+                preflight=PreflightResult(ok=True, errors=(), wall_s=0.0),
+                episodes=tuple(
+                    _episode_record(index, seed) for index, seed in enumerate(seed_values)
+                ),
+                failures={"timeout": len(seed_values)},
+                safety=SafetyResult(ungated=0, clamps=0, extra_item=0),
+                timing={"wall_s": 0.0, "sim_s": 0.0},
+                artifacts={},
+            )
+
+    runtime = _controller_runtime(controller, adapter_factory=lambda condition, worktree: Adapter())
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+    session = json.loads((session_dir / "session.json").read_text())
+    session.update(state="running", budgets={"tokens": 500000, "episodes": 2, "wall_h": 4})
+    (session_dir / "session.json").write_text(json.dumps(session))
+
+    heldout_rc, heldout, _, _ = _invoke_controller(
+        controller,
+        [
+            "attempt",
+            "--session",
+            str(session_dir),
+            "--seeds",
+            "100",
+        ],
+        runtime,
+    )
+    first_rc, first, _, _ = _invoke_controller(
+        controller,
+        [
+            "attempt",
+            "--session",
+            str(session_dir),
+            "--seeds",
+            "0,1",
+        ],
+        runtime,
+    )
+    exhausted_rc, exhausted, _, _ = _invoke_controller(
+        controller,
+        [
+            "attempt",
+            "--session",
+            str(session_dir),
+            "--seeds",
+            "2",
+        ],
+        runtime,
+    )
+
+    assert heldout_rc == 1 and heldout["code"] == "SEED_DOMAIN"
+    assert first_rc == 0 and first["ok"] is True
+    assert exhausted_rc == 1 and exhausted["code"] == "EPISODE_BUDGET"
+    assert launches == ["0,1"]
+
+
+def test_controller_audit_rejects_unowned_launch_and_attempt_correlation_tamper(
+    tmp_path: Path,
+):
+    """CON-7: every development launch has exactly one controller admission and manifest."""
+    from tools import s1_harness_ablation as controller
+
+    runtime = _controller_runtime(controller)
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+    orphan = session_dir / "worktree" / "runs" / "orphan"
+    orphan.mkdir(parents=True)
+    (orphan / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "orphan",
+                "env_baseline": "origin/main",
+                "env_baseline_oid": "a" * 40,
+            }
+        )
+    )
+    (orphan / "episodes.jsonl").write_text("")
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["audit", "--dir", str(session_dir)],
+        runtime,
+    )
+
+    assert returncode == 1
+    assert response["ok"] is False
+    audit = json.loads((session_dir / "audit.json").read_text())
+    assert "UNOWNED_LAUNCH" in audit["issues"]
+
+
+def test_script_rollout_explicit_root_pins_wrapper_runs_and_pythonpath(tmp_path: Path, monkeypatch):
+    """CON-5, CON-7: script execution resolves every trusted path inside its session worktree."""
+    from aisle.harness import script_rollout
+
+    graph_dir = tmp_path / "graphs"
+    graph_dir.mkdir()
+    (graph_dir / "ablation_script_s1_wrapper.yaml").write_text(
+        (REPO_ROOT / "graphs" / "ablation_script_s1_wrapper.yaml").read_text()
+    )
+    policy = tmp_path / "baselines" / "script_s1" / "candidate.py"
+    policy.parent.mkdir(parents=True)
+    policy.write_text("def create_policy(seed):\n    return object()\n")
+    captured: dict[str, object] = {}
+
+    class CompletedGraph:
+        pid = 999_999_999
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def launch(graph: Path, run_dir: Path, env: dict, stderr):
+        captured.update(graph=graph, run_dir=run_dir, env=env)
+        return CompletedGraph()
+
+    monkeypatch.setattr(script_rollout, "_spawn_script_dora", launch)
+    monkeypatch.setattr(script_rollout, "_terminate_script", lambda proc: None)
+    monkeypatch.setattr(script_rollout, "reap_orphans", lambda run_dir: None)
+
+    script_rollout.run_script_rollout(policy, "3", "pinned-script", root=tmp_path)
+
+    assert Path(captured["run_dir"]) == tmp_path / "runs" / "pinned-script"
+    assert Path(captured["graph"]).is_relative_to(tmp_path / "runs" / "pinned-script")
+    assert captured["env"]["PYTHONPATH"] == f"{tmp_path / 'src'}:{tmp_path}"
+    assert captured["env"]["AISLE_SCRIPT_POLICY"] == str(policy)
+
+
+def test_script_preflight_explicit_root_executes_the_pinned_worker(tmp_path: Path):
+    """CON-5, CON-7: script preflight never imports a worker from the controller checkout."""
+    from aisle.harness.script_preflight import _worker_command
+
+    candidate = tmp_path / "candidate.py"
+
+    assert _worker_command(candidate, root=tmp_path) == [
+        sys.executable,
+        "-I",
+        str(tmp_path / "src" / "aisle" / "harness" / "script_preflight_worker.py"),
+        str(candidate.resolve()),
+    ]
+
+
+def test_controller_script_factory_injects_the_session_worktree_root(tmp_path: Path, monkeypatch):
+    """CON-5: the controller pins both script gates to the assigned worktree."""
+    from aisle.harness import ablation_adapters
+    from aisle.harness.ablation import (
+        AttemptResult,
+        PreflightResult,
+        SafetyResult,
+        sha256_file,
+    )
+    from tools import s1_harness_ablation as controller
+
+    roots: list[Path] = []
+
+    def preflight(candidate: Path, *, root: Path):
+        roots.append(root)
+        return PreflightResult(ok=True, errors=(), wall_s=0.0)
+
+    def rollout(candidate: Path, seeds: str, run_id: str, *, root: Path):
+        roots.append(root)
+        return AttemptResult(
+            attempt_id=run_id,
+            candidate_hash=sha256_file(candidate),
+            preflight=PreflightResult(ok=True, errors=(), wall_s=0.0),
+            episodes=(),
+            failures={"ROLLOUT_INCOMPLETE": 1},
+            safety=SafetyResult(ungated=0, clamps=0, extra_item=0),
+            timing={"wall_s": 0.0, "sim_s": 0.0},
+            artifacts={},
+        )
+
+    monkeypatch.setattr(ablation_adapters, "preflight_script", preflight)
+    monkeypatch.setattr(ablation_adapters, "run_script_rollout", rollout)
+    candidate = tmp_path / "candidate.py"
+    candidate.write_text("def create_policy(seed):\n    return object()\n")
+
+    adapter = controller.default_adapter_factory("script", tmp_path)
+    adapter.rollout(candidate, "3", "factory-pinned")
+
+    assert roots == [tmp_path.resolve(), tmp_path.resolve()]
+
+
+def test_controller_scoring_admission_is_terminal_after_adapter_crash(tmp_path: Path, monkeypatch):
+    """CON-5, CON-7: held-out admission is persisted once before a crashing adapter."""
+    from tools import s1_harness_ablation as controller
+
+    calls = 0
+
+    class CrashingAdapter:
+        def rollout(self, candidate: Path, seeds: str, run_id: str):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("fixture scorer crash")
+
+    monkeypatch.setattr(controller, "_new_nonce", lambda: "score-once", raising=False)
+    runtime = _controller_runtime(
+        controller,
+        adapter_factory=lambda condition, worktree: CrashingAdapter(),
+    )
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+
+    first_rc, first, _, _ = _invoke_controller(
+        controller,
+        ["score", "--session", str(session_dir), "--holdout", "100..107"],
+        runtime,
+    )
+    second_rc, second, _, _ = _invoke_controller(
+        controller,
+        ["score", "--session", str(session_dir), "--holdout", "100..107"],
+        runtime,
+    )
+
+    assert first_rc == 1
+    assert first["ok"] is False
+    assert second_rc == 1 and second["code"] == "SCORING_TERMINAL"
+    assert calls == 1
+    session = json.loads((session_dir / "session.json").read_text())
+    holdout = json.loads((session_dir / "holdout.json").read_text())
+    assert session["state"] == "scoring_started"
+    assert holdout["state"] == "scoring_started"
+    assert session["scoring_admission"]["nonce"] == "score-once"
+
+
+def test_controller_scoring_result_must_match_its_nonce_admission(tmp_path: Path):
+    """CON-7: a held-out adapter cannot substitute a result from another run."""
+    from aisle.harness.ablation import (
+        AttemptResult,
+        PreflightResult,
+        SafetyResult,
+        sha256_file,
+    )
+    from tools import s1_harness_ablation as controller
+
+    class SubstitutingAdapter:
+        def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
+            return AttemptResult(
+                attempt_id="different-run",
+                candidate_hash=sha256_file(candidate),
+                preflight=PreflightResult(ok=True, errors=(), wall_s=0.0),
+                episodes=tuple(
+                    _episode_record(index, seed) for index, seed in enumerate(range(100, 108))
+                ),
+                failures={"timeout": 8},
+                safety=SafetyResult(ungated=0, clamps=0, extra_item=0),
+                timing={"wall_s": 0.0, "sim_s": 0.0},
+                artifacts={},
+            )
+
+    runtime = _controller_runtime(
+        controller,
+        adapter_factory=lambda condition, worktree: SubstitutingAdapter(),
+    )
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["score", "--session", str(session_dir), "--holdout", "100..107"],
+        runtime,
+    )
+
+    assert returncode == 1
+    assert response["code"] == "INFRA_PROTOCOL"
+    assert json.loads((session_dir / "session.json").read_text())["state"] == ("scoring_started")
+
+
+def test_controller_serializes_concurrent_holdout_admission(tmp_path: Path):
+    """CON-7: concurrent scorers cannot both cross the single-use admission boundary."""
+    from aisle.harness.ablation import (
+        AttemptResult,
+        PreflightResult,
+        SafetyResult,
+        sha256_file,
+    )
+    from tools import s1_harness_ablation as controller
+
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    class BlockingAdapter:
+        def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
+            calls.append(run_id)
+            entered.set()
+            assert release.wait(timeout=2)
+            return AttemptResult(
+                attempt_id=run_id,
+                candidate_hash=sha256_file(candidate),
+                preflight=PreflightResult(ok=True, errors=(), wall_s=0.0),
+                episodes=tuple(
+                    _episode_record(index, seed) for index, seed in enumerate(range(100, 108))
+                ),
+                failures={"timeout": 8},
+                safety=SafetyResult(ungated=0, clamps=0, extra_item=0),
+                timing={"wall_s": 0.0, "sim_s": 0.0},
+                artifacts={},
+            )
+
+    runtime = _controller_runtime(
+        controller,
+        adapter_factory=lambda condition, worktree: BlockingAdapter(),
+    )
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+    args = controller.argparse.Namespace(session=str(session_dir), holdout="100..107")
+    outcomes: list[object] = []
+
+    def score() -> None:
+        try:
+            outcomes.append(controller._score(args, runtime))
+        except controller.ControllerError as exc:
+            outcomes.append(exc)
+
+    first = threading.Thread(target=score)
+    second = threading.Thread(target=score)
+    first.start()
+    assert entered.wait(timeout=2)
+    second.start()
+    assert len(calls) == 1
+    release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert len(calls) == 1
+    assert sum(isinstance(outcome, controller.ControllerError) for outcome in outcomes) == 1
+    assert json.loads((session_dir / "session.json").read_text())["state"] == "scored"
+
+
+def test_controller_attempt_broker_authenticates_requests(tmp_path: Path):
+    """CON-7: an IPC caller without the controller capability cannot launch an adapter."""
+    from tools import s1_harness_ablation as controller
+
+    runtime = _controller_runtime(controller)
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+    args = controller.argparse.Namespace(session=str(session_dir), seeds="0")
+
+    with controller.AttemptBroker(session_dir, runtime) as broker:
+        environment = broker.environment()
+        environment["AISLE_ABLATION_CAPABILITY"] = "wrong"
+        response = controller._attempt_client(args, environment)
+
+    assert response["ok"] is False
+    assert response["code"] == "ATTEMPT_BROKER_AUTH"
+
+
+def test_controller_audit_charges_crashed_attempt_admission_conservatively(tmp_path: Path):
+    """CON-7: an unsettled adapter launch consumes its full requested reservation."""
+    from tools import s1_harness_ablation as controller
+
+    class CrashingAdapter:
+        def rollout(self, candidate: Path, seeds: str, run_id: str):
+            raise RuntimeError("fixture development crash")
+
+    runtime = _controller_runtime(
+        controller,
+        adapter_factory=lambda condition, worktree: CrashingAdapter(),
+    )
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+    session = json.loads((session_dir / "session.json").read_text())
+    session.update(state="running", budgets={"tokens": 500000, "episodes": 2, "wall_h": 4})
+    (session_dir / "session.json").write_text(json.dumps(session))
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["attempt", "--session", str(session_dir), "--seeds", "0,1"],
+        runtime,
+    )
+    assert returncode == 1 and response["code"] == "INTERNAL"
+
+    _, audit, _, _ = _invoke_controller(
+        controller,
+        ["audit", "--dir", str(session_dir)],
+        runtime,
+    )
+    session_audit = audit["sessions"][0]
+    assert session_audit["development_episodes"] == 2
+    assert "ATTEMPT_CORRELATION_INVALID" in session_audit["issues"]
+
+
+def test_controller_holdout_admission_refuses_preexisting_nonce_run(tmp_path: Path, monkeypatch):
+    """CON-7: a pre-admission same-ID manifest can never gain scorer exemption."""
+    from tools import s1_harness_ablation as controller
+
+    monkeypatch.setattr(controller, "_new_nonce", lambda: "collision", raising=False)
+    runtime = _controller_runtime(controller)
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+    collision = session_dir / "worktree" / "runs" / f"holdout-{result['sessions'][0]}-collision"
+    collision.mkdir(parents=True)
+    (collision / "manifest.json").write_text(
+        json.dumps({"run_id": collision.name, "env_baseline": "origin/main"})
+    )
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["score", "--session", str(session_dir), "--holdout", "100..107"],
+        runtime,
+    )
+
+    assert returncode == 1
+    assert response["code"] == "HOLDOUT_RUN_COLLISION"
+    assert json.loads((session_dir / "session.json").read_text())["state"] == ("scoring_started")
+
+
+@pytest.mark.parametrize(
+    ("agent", "event"),
+    [
+        ("claude", {"type": "assistant", "message": {"usage": {}}}),
+        (
+            "claude",
+            {
+                "type": "assistant",
+                "message": {"usage": {"input_tokens": 1, "output_tokens": 1}},
+            },
+        ),
+        (
+            "codex",
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        ),
+    ],
+)
+def test_controller_partial_vendor_usage_objects_fail_closed(agent: str, event: dict):
+    """HAR-5: every mandated vendor usage field must be present and exact."""
+    from tools import s1_harness_ablation as controller
+
+    with pytest.raises(controller.TelemetryError):
+        controller._agent_event(json.dumps(event), agent)
+
+
+def test_controller_token_overshoot_and_wall_stop_are_nonzero_terminal_outcomes(
+    tmp_path: Path,
+):
+    """HAR-5, CON-8: external token or wall enforcement never reports a successful run."""
+    from tools import s1_harness_ablation as controller
+
+    overshoot = (
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "usage": {
+                        "input_tokens": 500_000,
+                        "cache_creation_input_tokens": 1,
+                        "output_tokens": 0,
+                    }
+                },
+            }
+        )
+        + "\n"
+    )
+    token_runtime = _controller_runtime(controller, agent_lines=(overshoot,))
+    token_campaign, token_result, _ = _prepare_controller_campaign(
+        controller, tmp_path / "token", runtime=token_runtime
+    )
+    token_session = token_campaign / token_result["sessions"][0]
+
+    token_rc, token_response, _, _ = _run_prepared_controller_session(
+        controller, token_session, token_runtime
+    )
+
+    assert token_rc == 1
+    assert token_response["code"] == "TOKEN_BUDGET_EXCEEDED"
+    assert json.loads((token_session / "session.json").read_text())["state"] == ("budget_exceeded")
+
+    base_runtime = _controller_runtime(controller)
+
+    def wall_executor(command, cwd, agent, on_line, stop_reason, wall_ceiling_s, environment):
+        line = (
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 1,
+                            "cache_creation_input_tokens": 0,
+                            "output_tokens": 1,
+                        }
+                    },
+                }
+            )
+            + "\n"
+        )
+        on_line(line, wall_ceiling_s)
+        return controller.ExecutionResult(
+            stopped="wall_budget",
+            returncode=-signal.SIGKILL,
+            wall_s=wall_ceiling_s,
+            agent_version="fixture-agent-1",
+        )
+
+    wall_runtime = replace(base_runtime, execute_agent=wall_executor)
+    wall_campaign, wall_result, _ = _prepare_controller_campaign(
+        controller, tmp_path / "wall", runtime=wall_runtime
+    )
+    wall_session = wall_campaign / wall_result["sessions"][0]
+    wall_rc, wall_response, _, _ = _run_prepared_controller_session(
+        controller, wall_session, wall_runtime
+    )
+
+    assert wall_rc == 1
+    assert wall_response["code"] == "WALL_BUDGET_EXCEEDED"
+    assert json.loads((wall_session / "session.json").read_text())["state"] == ("budget_exceeded")
+
+
+def test_controller_unbrokered_simulator_observation_is_terminal_and_audited(
+    tmp_path: Path,
+):
+    """CON-7: an observed agent-owned simulator child terminates and excludes the session."""
+    from tools import s1_harness_ablation as controller
+
+    base_runtime = _controller_runtime(controller)
+
+    def executor(command, cwd, agent, on_line, stop_reason, wall_ceiling_s, environment):
+        line = (
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 1,
+                            "cache_creation_input_tokens": 0,
+                            "output_tokens": 1,
+                        }
+                    },
+                }
+            )
+            + "\n"
+        )
+        on_line(line, 0.1)
+        return controller.ExecutionResult(
+            stopped="unowned_launch",
+            returncode=-signal.SIGKILL,
+            wall_s=0.1,
+            agent_version="fixture-agent-1",
+        )
+
+    runtime = replace(base_runtime, execute_agent=executor)
+    campaign, result, _ = _prepare_controller_campaign(controller, tmp_path, runtime=runtime)
+    session_dir = campaign / result["sessions"][0]
+
+    returncode, response, _, _ = _run_prepared_controller_session(controller, session_dir, runtime)
+    assert returncode == 1 and response["code"] == "UNOWNED_LAUNCH"
+
+    _, audit, _, _ = _invoke_controller(
+        controller,
+        ["audit", "--dir", str(session_dir)],
+        runtime,
+    )
+    assert "UNOWNED_LAUNCH" in audit["sessions"][0]["exclusions"]
+
+
+def test_controller_detects_agent_descendant_harness_rollout_from_fake_proc(
+    tmp_path: Path,
+):
+    """CON-7: process evidence distinguishes an agent-owned launch from broker children."""
+    from tools import s1_harness_ablation as controller
+
+    for pid, parent, command in (
+        (100, 1, b"claude\0"),
+        (101, 100, b"/fixture/bin/harness\0rollout\0--seeds\00\0"),
+        (102, 1, b"dora\0run\0broker-owned\0"),
+    ):
+        process = tmp_path / str(pid)
+        process.mkdir()
+        (process / "status").write_text(f"Name:\tfixture\nPPid:\t{parent}\n")
+        (process / "cmdline").write_bytes(command)
+
+    assert controller._has_unowned_simulator_descendant(100, tmp_path) is True
+    assert controller._has_unowned_simulator_descendant(102, tmp_path) is False
+
+
+def test_controller_stdout_eof_wait_is_bounded_by_remaining_wall(tmp_path: Path, monkeypatch):
+    """CON-7: an agent closing stdout cannot make the controller wait past wall budget."""
+    from tools import s1_harness_ablation as controller
+
+    killed: list[int] = []
+
+    class EmptyStdout:
+        def __iter__(self):
+            return iter(())
+
+        def close(self):
+            return None
+
+    class StuckAfterEof:
+        pid = 12345
+        stdout = EmptyStdout()
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            if killed:
+                return -signal.SIGKILL
+            if timeout is None:
+                raise AssertionError("unbounded wait after stdout EOF")
+            raise subprocess.TimeoutExpired(["fixture-agent"], timeout)
+
+    monkeypatch.setattr(controller.subprocess, "Popen", lambda *args, **kwargs: StuckAfterEof())
+    monkeypatch.setattr(controller.os, "killpg", lambda pid, sig: killed.append(sig))
+    monkeypatch.setattr(controller, "_agent_version", lambda agent: "fixture-agent-1")
+
+    result = controller._execute_agent(
+        ["fixture-agent"],
+        tmp_path,
+        "claude",
+        lambda line, wall: None,
+        lambda wall: None,
+        0.01,
+        {},
+    )
+
+    assert result.stopped == "wall_budget"
+    assert killed == [signal.SIGKILL]
+
+
+@pytest.mark.parametrize("argv", [["--help"], ["run", "--help"]])
+def test_controller_help_is_one_success_json_object(argv: list[str]):
+    """CON-8: help follows the same single-JSON and exit-status contract."""
+    from tools import s1_harness_ablation as controller
+
+    stdout = StringIO()
+    with redirect_stdout(stdout):
+        returncode = controller.main(argv)
+    response = json.loads(stdout.getvalue())
+
+    assert returncode == 0
+    assert response["ok"] is True
+    assert isinstance(response["usage"], dict)
+    assert stdout.getvalue().count("\n") == 1

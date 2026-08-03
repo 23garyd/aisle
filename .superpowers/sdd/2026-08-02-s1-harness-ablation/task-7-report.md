@@ -17,9 +17,11 @@ and fake adapters.
 
 - Created `tools/s1_harness_ablation.py`.
 - Extended `tests/unit/test_s1_harness_ablation.py`.
+- Updated the script adapter, preflight worker, and rollout launcher so every
+  trusted script path is rooted in the assigned session worktree.
 - Created this report.
-- No specification, frozen environment, runner, starter, adapter, CUDA, lock,
-  or dependency file was changed.
+- No specification, frozen environment, starter, CUDA, lock, or dependency
+  file was changed.
 
 Each prepared session has exactly these controller artifacts:
 
@@ -162,14 +164,9 @@ The smoke exited `1` and emitted exactly one JSON object.
 The reviewed diff is limited to the requested controller, shared ablation unit
 file, and this report. `git diff --check` is clean.
 
-The main design compromise follows the reviewed four-command interface:
-`attempts.jsonl` is initialized, integrity-checked, and consumed as canonical
-`AttemptResult` rows, but the interface does not add an unreviewed
-development-attempt RPC. Existing in-session harness rollouts remain evidenced
-by their protected run manifests, episode files, and budget ledger; audit
-checks those artifacts for held-out and local-baseline contamination. A future
-operator-facing attempt RPC should be designed explicitly rather than silently
-expanding this task's frozen CLI.
+The reviewed four-command public interface remains unchanged. Development
+attempts use an internal, agent-facing controller command that is omitted from
+public help and is available only while the assigned session is running.
 
 ## Proof no research or simulator session ran
 
@@ -185,3 +182,151 @@ expanding this task's frozen CLI.
   error path.
 - No paid token session, research session, pilot/main campaign, held-out
   simulation, graph/sim marker, or simulator workload was launched.
+
+## Fix round 1 — controller ownership and crash-safe admission
+
+### Review findings closed
+
+1. Development and regression attempts now pass through an authenticated
+   Unix-socket service in the already-running external controller. The
+   agent-facing command uses the external controller file only as a client;
+   it cannot invoke an adapter itself.
+   Under an exclusive admission lock, the service validates seeds `0..49`,
+   charges requested capacity before the assigned adapter, appends one
+   canonical `AttemptResult`, writes a `controller_attempt.json` correlation
+   manifest, and settles actual episode spend. The agent receives a
+   session-scoped capability, while audit records only its hash and the exact
+   external controller hash.
+2. Audit now requires a one-to-one admission/result/settlement/controller
+   manifest chain, verifies optional adapter-manifest hashes, reports total
+   development spend, enforces the requested ceiling, and rejects every other
+   run directory as `UNOWNED_LAUNCH`. Settled attempts charge actual episodes;
+   crashed/unsettled admissions conservatively charge their full reservation.
+   During the agent session, the controller also watches the agent process
+   tree and kills canonical dora, Genesis, or harness-rollout launchers that
+   are not descendants of the controller-owned broker.
+3. `ScriptAdapter` receives the session worktree root. Script preflight,
+   worker, wrapper instrumentation, run directory, trusted `PYTHONPATH`, and
+   graph budget inputs all resolve from that root; focused tests assert the
+   exact paths without launching dora or a simulator.
+4. Held-out scoring is serialized on the stable attempts artifact and
+   persists a random nonce, nonce-derived run ID, candidate
+   hash, start time, and `scoring_started` state before the adapter boundary.
+   Concurrent callers reload state only after acquiring the lock. A crash or
+   pre-existing same-ID run remains terminal, so a retry cannot execute the
+   holdout twice.
+5. Completed holdout admission is authorized only by its nonce-bound
+   `controller_holdout.json` hash and optional adapter-manifest hash. A
+   pre-admission run with the same ID never gains the audit exemption.
+6. Every mandatory Claude/Codex usage field must be present as an exact,
+   non-negative integer; partial usage objects fail closed.
+7. Token and wall ceilings now produce nonzero CLI results and persist the
+   terminal `budget_exceeded` state. After stdout EOF, process waiting is
+   bounded by only the remaining wall budget before process-group kill.
+   Non-finite wall limits are refused before agent launch.
+8. Root and subcommand help emit exactly one successful JSON object and keep
+   the internal attempt command out of the public command list.
+
+### RED evidence
+
+The first focused review-regression selection was run before the fixes:
+
+```text
+UV_PROJECT_ENVIRONMENT=/home/demo/Public/github_aisle/aisle-latest/.venv \
+PYTHONPATH=$PWD/src:$PWD \
+uv run --no-sync pytest tests/unit/test_s1_harness_ablation.py \
+  -k 'supervises_dev_attempts or attempt_channel or unowned_launch or \
+explicit_root or scoring_admission or holdout_admission or partial_vendor or \
+overshoot_and_wall or stdout_eof or help_is_one' -q
+
+14 failed, 107 deselected in 1.19s
+```
+
+The failures reproduced the missing attempt command, unpinned script root,
+retryable scoring crash, predictable holdout admission, accepted partial usage
+objects, successful budget-stop exits, unbounded executor signature, and
+argparse help output.
+
+A later fail-closed scoring-correlation test was also observed RED before its
+fix:
+
+```text
+1 failed, 121 deselected in 0.26s
+```
+
+The wrong attempt ID was initially accepted as a held-out result. Scoring now
+validates the canonical result against the nonce-derived run ID and admitted
+candidate hash.
+
+### GREEN and final gates
+
+Controller and adapter regression file after formatting:
+
+```text
+129 passed
+```
+
+Campaign/controller compatibility:
+
+```text
+154 passed in 9.66s
+```
+
+Repository static gates:
+
+```text
+163 files already formatted
+All checks passed!
+```
+
+Full isolated unit gate before the final broker/race hardening (the affected
+combined gate above was rerun afterward):
+
+```text
+645 passed, 1 skipped, 168 deselected in 217.03s (0:03:37)
+```
+
+Traceability gate:
+
+```json
+{"ok":true,"uncovered":[],"errors":[]}
+```
+
+`git diff --check` also passed.
+
+### Execution safety
+
+Every added execution boundary was exercised with an authenticated local test
+socket, injected fake agent executors, fake condition adapters, fake
+subprocesses, or path-only assertions. No real coding agent, dora graph,
+Genesis process, simulator episode, development rollout, or held-out rollout
+was launched during this fix round.
+
+### Remaining infrastructure boundary
+
+The controller now brokers all authorized adapter launches and kills observed
+canonical `dora`, Genesis, and `harness rollout` descendants of the coding
+agent. This is stronger evidence than run-directory scanning, but it is not an
+OS security boundary. The reviewed campaign launcher deliberately gives
+Claude skipped permissions and Codex `danger-full-access`; both run as the
+same user with filesystem and network access. An adversarial agent could
+rename a launcher or import simulator libraries from an arbitrary Python
+script, which process-command inspection cannot prove absent.
+
+Complete prevention therefore requires an ADR-level execution change outside
+Task 7: either sandbox the coding agent with a simulator-denying syscall/filesystem
+policy while preserving its model connection, or move simulator startup into
+a trusted service/binary that rejects every launch without a
+controller-private capability. This report does not claim that artifact or
+process scanning provides that missing kernel-level confinement.
+
+The confinement blocker now has an approved strong resolution:
+
+- `docs/superpowers/specs/2026-08-02-native-agent-simulator-isolation-design.md`
+  (design commit `d78781c`);
+- `docs/superpowers/plans/2026-08-02-native-agent-simulator-isolation.md`
+  (implementation-plan commit `2fdab3a`).
+
+This fix-round commit is an intermediate checkpoint only. The approved
+Bubblewrap/trusted-service design remains to be implemented by that separate
+plan before Task 7 can claim complete exclusive simulator brokerage.

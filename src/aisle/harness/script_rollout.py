@@ -209,7 +209,9 @@ def _trace_text(path: Path) -> list[str]:
     return rows
 
 
-def _extract_external_diagnostics(run_dir: Path) -> tuple[list[dict] | None, str | None]:
+def _extract_external_diagnostics(
+    run_dir: Path, root: Path
+) -> tuple[list[dict] | None, str | None]:
     traces = run_dir / "traces"
     violations = complete_violation_stream(traces / "budget-guard__violation.arrow")
     events = _trace_text(traces / "script-s1-runtime__policy_event.arrow")
@@ -217,7 +219,7 @@ def _extract_external_diagnostics(run_dir: Path) -> tuple[list[dict] | None, str
         return violations, None
     policy_log = run_dir / "policy_events.jsonl"
     policy_log.write_text("".join(f"{event}\n" for event in events))
-    return violations, str(policy_log.relative_to(_repository_root()))
+    return violations, str(policy_log.relative_to(root))
 
 
 def _failure_counts(episodes: list[dict]) -> dict[str, int]:
@@ -230,7 +232,9 @@ def _failure_counts(episodes: list[dict]) -> dict[str, int]:
     return failures
 
 
-def run_script_rollout(policy: Path, seeds: str, run_id: str) -> AttemptResult:
+def run_script_rollout(
+    policy: Path, seeds: str, run_id: str, *, root: Path | None = None
+) -> AttemptResult:
     """Launch the fixed wrapper, parse its structured outputs, and clean up.
 
     This function intentionally performs no candidate preflight and no graph
@@ -246,7 +250,7 @@ def run_script_rollout(policy: Path, seeds: str, run_id: str) -> AttemptResult:
     if not seed_values:
         raise ValueError("at least one seed is required")
 
-    root = _repository_root().resolve()
+    root = (root or _repository_root()).resolve()
     run_dir = root / "runs" / run_id
     if run_dir.exists():
         raise ValueError(f"run_id {run_id!r} already exists; refusing to overwrite")
@@ -303,7 +307,7 @@ def run_script_rollout(policy: Path, seeds: str, run_id: str) -> AttemptResult:
         code = "COMMAND_INVALID" if "COMMAND_INVALID" in runtime_log else "ROLLOUT_INCOMPLETE"
         failures[code] = failures.get(code, 0) + 1
 
-    violations, policy_log = _extract_external_diagnostics(run_dir)
+    violations, policy_log = _extract_external_diagnostics(run_dir, root)
     extra_items = sum(
         1
         for episode in episodes

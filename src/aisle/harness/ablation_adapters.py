@@ -300,12 +300,24 @@ class ScriptAdapter:
     def __init__(
         self,
         *,
-        preflight_runner: ScriptPreflightRunner = preflight_script,
-        rollout_runner: ScriptRolloutRunner = run_script_rollout,
+        root: Path | None = None,
+        preflight_runner: ScriptPreflightRunner | None = None,
+        rollout_runner: ScriptRolloutRunner | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._preflight_runner = preflight_runner
-        self._rollout_runner = rollout_runner
+        trusted_root = root.resolve() if root is not None else None
+        self._preflight_runner = preflight_runner or (
+            preflight_script
+            if trusted_root is None
+            else lambda candidate: preflight_script(candidate, root=trusted_root)
+        )
+        self._rollout_runner = rollout_runner or (
+            run_script_rollout
+            if trusted_root is None
+            else lambda candidate, seeds, run_id: run_script_rollout(
+                candidate, seeds, run_id, root=trusted_root
+            )
+        )
         self._clock = clock
         self._policy_logs: dict[Path, str] = {}
         self._preflights: dict[Path, tuple[str, PreflightResult]] = {}
