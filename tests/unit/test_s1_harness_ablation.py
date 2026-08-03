@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -2650,6 +2651,448 @@ def test_controller_help_is_one_success_json_object(argv: list[str]):
     assert returncode == 0
     assert response["ok"] is True
     assert isinstance(response["usage"], dict)
+    assert stdout.getvalue().count("\n") == 1
+
+
+def _fixture_agent_environment(destination: Path) -> Path:
+    bin_dir = destination / "bin"
+    bin_dir.mkdir(parents=True)
+    python = bin_dir / "python"
+    python.write_bytes(b"fixture-agent-python\n")
+    python.chmod(python.stat().st_mode | stat.S_IXUSR)
+    pytest_executable = bin_dir / "pytest"
+    pytest_executable.write_text("#!/agent-env/bin/python\n")
+    pytest_executable.chmod(pytest_executable.stat().st_mode | stat.S_IXUSR)
+    return python
+
+
+def test_agent_environment_sync_targets_only_explicit_isolated_destination(
+    tmp_path: Path, monkeypatch
+):
+    """CON-1, CON-5, CON-7: default+dev sync targets only the controller-owned agent env."""
+    from tools import build_s1_agent_env as builder
+
+    repo = tmp_path / "assigned-session-worktree"
+    repo.mkdir()
+    (repo / "uv.lock").write_bytes(b"fixture-lock\n")
+    (repo / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='0.0.0'\n")
+    host_venv = repo / ".venv"
+    host_venv.mkdir()
+    host_marker = host_venv / "host-cuda-environment"
+    host_marker.write_bytes(b"must-not-change")
+    destination = tmp_path / "controller-agent-environments" / "s1"
+    calls = []
+
+    def fake_runner(command, *, cwd, env):
+        calls.append((command, cwd, env))
+        _fixture_agent_environment(destination)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        builder,
+        "inspect_agent_environment",
+        lambda path: builder.AgentEnvironmentSpec(
+            python=str((path / "bin" / "python").resolve()),
+            lock_sha256="unused-by-inspection",
+            distributions=("aisle==0.1.0", "pytest==9.0.0"),
+            executables=("pytest", "python"),
+        ),
+    )
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(host_venv))
+
+    result = builder.build_agent_environment(repo, destination, runner=fake_runner)
+
+    assert len(calls) == 1
+    command, cwd, environment = calls[0]
+    assert command == ["uv", "sync", "--frozen", "--no-extra", "sim", "--group", "dev"]
+    assert cwd == repo.resolve()
+    assert environment["UV_PROJECT_ENVIRONMENT"] == str(destination.resolve())
+    assert environment["UV_PROJECT_ENVIRONMENT"] != str(host_venv.resolve())
+    assert host_marker.read_bytes() == b"must-not-change"
+    assert result["ok"] is True
+    assert result["environment"] == str(destination.resolve())
+    assert result["lock_sha256"] == (
+        "b636fb14b47b7d83c9f26513d1341f630f18c8960192897a73e885e4303162dc"
+    )
+    for field in (
+        "builder_sha256",
+        "python_sha256",
+        "distribution_inventory_sha256",
+        "executable_inventory_sha256",
+        "inventory_sha256",
+    ):
+        assert len(result[field]) == 64
+        int(result[field], 16)
+
+
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        "genesis-world==1.2.3",
+        "Genesis_World==1.2.3",
+        "dora-rs==0.5.0",
+        "DORA.RS==0.5.0",
+        "torch==2.13.0",
+        "nvidia-cublas-cu12==12.0",
+        "NVIDIA_CUDNN_CU12==9.0",
+    ],
+)
+def test_agent_environment_inspection_rejects_simulator_and_gpu_distributions(
+    tmp_path: Path, monkeypatch, distribution: str
+):
+    """CON-1, CON-7: normalized simulator and GPU distribution names fail closed."""
+    from tools import build_s1_agent_env as builder
+
+    destination = tmp_path / "agent-environment"
+    _fixture_agent_environment(destination)
+    monkeypatch.setattr(
+        builder,
+        "_read_distribution_inventory",
+        lambda python: ("aisle==0.1.0", distribution),
+    )
+
+    with pytest.raises(builder.AgentEnvironmentError) as raised:
+        builder.inspect_agent_environment(destination)
+
+    assert raised.value.code == "FORBIDDEN_DISTRIBUTION"
+
+
+@pytest.mark.parametrize("executable", ["dora", "genesis"])
+def test_agent_environment_inspection_rejects_simulator_executables(
+    tmp_path: Path, monkeypatch, executable: str
+):
+    """CON-7: simulator launch executables are forbidden even without their distributions."""
+    from tools import build_s1_agent_env as builder
+
+    destination = tmp_path / "agent-environment"
+    _fixture_agent_environment(destination)
+    forbidden = destination / "bin" / executable
+    forbidden.write_text("#!/bin/sh\n")
+    forbidden.chmod(forbidden.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setattr(
+        builder,
+        "_read_distribution_inventory",
+        lambda python: ("aisle==0.1.0", "pytest==9.0.0"),
+    )
+
+    with pytest.raises(builder.AgentEnvironmentError) as raised:
+        builder.inspect_agent_environment(destination)
+
+    assert raised.value.code == "FORBIDDEN_EXECUTABLE"
+
+
+def test_agent_environment_inspection_returns_canonical_inventory(tmp_path: Path, monkeypatch):
+    """CON-5, CON-7: the reusable environment identity is sorted and path-specific."""
+    from tools import build_s1_agent_env as builder
+
+    destination = tmp_path / "agent-environment"
+    python = _fixture_agent_environment(destination)
+    monkeypatch.setattr(
+        builder,
+        "_read_distribution_inventory",
+        lambda executable: ("pytest==9.0.0", "aisle==0.1.0"),
+    )
+
+    spec = builder.inspect_agent_environment(destination)
+
+    assert spec == builder.AgentEnvironmentSpec(
+        python=str(python.resolve()),
+        lock_sha256="",
+        distributions=("aisle==0.1.0", "pytest==9.0.0"),
+        executables=("pytest", "python"),
+    )
+
+
+@pytest.mark.parametrize("distribution", ["!invalid==1.0", "aisle==1.0==forged"])
+def test_agent_environment_inspection_rejects_malformed_distribution_entries(
+    tmp_path: Path, monkeypatch, distribution: str
+):
+    """CON-5, CON-7: malformed metadata cannot acquire a reusable environment identity."""
+    from tools import build_s1_agent_env as builder
+
+    destination = tmp_path / "agent-environment"
+    _fixture_agent_environment(destination)
+    monkeypatch.setattr(
+        builder,
+        "_read_distribution_inventory",
+        lambda python: (distribution,),
+    )
+
+    with pytest.raises(builder.AgentEnvironmentError) as raised:
+        builder.inspect_agent_environment(destination)
+
+    assert raised.value.code == "INVENTORY_MALFORMED"
+
+
+def _fixture_agent_repository(tmp_path: Path) -> Path:
+    repo = tmp_path / "assigned-session-worktree"
+    repo.mkdir()
+    (repo / "uv.lock").write_bytes(b"fixture-lock\n")
+    (repo / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='0.0.0'\n")
+    return repo
+
+
+def test_agent_environment_matching_attestation_is_reused_without_sync(tmp_path: Path, monkeypatch):
+    """CON-5, CON-7: an exact live inventory and provenance match is reused unchanged."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = tmp_path / "controller-environments" / "s1"
+    sync_calls = []
+
+    def fake_runner(command, *, cwd, env):
+        sync_calls.append(command)
+        _fixture_agent_environment(destination)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        builder,
+        "_read_distribution_inventory",
+        lambda python: ("aisle==0.1.0", "pytest==9.0.0"),
+    )
+
+    first = builder.build_agent_environment(repo, destination, runner=fake_runner)
+    second = builder.build_agent_environment(repo, destination, runner=fake_runner)
+
+    assert first["ok"] is True and first["reused"] is False
+    assert second == {**first, "reused": True}
+    assert len(sync_calls) == 1
+
+
+def test_agent_environment_inspection_reports_attested_lock_after_build(
+    tmp_path: Path, monkeypatch
+):
+    """CON-5: the public environment spec carries the exact frozen-lock identity."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = tmp_path / "controller-environments" / "s1"
+
+    def fake_runner(command, *, cwd, env):
+        _fixture_agent_environment(destination)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        builder,
+        "_read_distribution_inventory",
+        lambda python: ("aisle==0.1.0", "pytest==9.0.0"),
+    )
+    result = builder.build_agent_environment(repo, destination, runner=fake_runner)
+
+    inspected = builder.inspect_agent_environment(destination)
+
+    assert result["ok"] is True
+    assert inspected.lock_sha256 == result["lock_sha256"]
+
+
+def test_agent_environment_lock_drift_is_quarantined_before_rebuild(tmp_path: Path, monkeypatch):
+    """CON-5, CON-7: lock drift preserves the prior env and rebuilds a fresh destination."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = tmp_path / "controller-environments" / "s1"
+    sync_count = 0
+
+    def fake_runner(command, *, cwd, env):
+        nonlocal sync_count
+        sync_count += 1
+        if sync_count == 2:
+            assert not destination.exists(), "drifted destination was not moved before sync"
+        _fixture_agent_environment(destination)
+        (destination / "generation").write_text(str(sync_count))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        builder,
+        "_read_distribution_inventory",
+        lambda python: ("aisle==0.1.0", "pytest==9.0.0"),
+    )
+    first = builder.build_agent_environment(repo, destination, runner=fake_runner)
+    (repo / "uv.lock").write_bytes(b"changed-lock\n")
+
+    second = builder.build_agent_environment(repo, destination, runner=fake_runner)
+
+    assert first["ok"] is True and second["ok"] is True
+    assert first["lock_sha256"] != second["lock_sha256"]
+    quarantine = destination.parent / ".s1-agent-env-quarantine"
+    quarantined = tuple(quarantine.iterdir())
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "generation").read_text() == "1"
+    assert (destination / "generation").read_text() == "2"
+
+
+def test_agent_environment_inventory_drift_is_quarantined_before_rebuild(
+    tmp_path: Path, monkeypatch
+):
+    """CON-5, CON-7: executable drift cannot be repaired in place or silently reused."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = tmp_path / "controller-environments" / "s1"
+    sync_count = 0
+
+    def fake_runner(command, *, cwd, env):
+        nonlocal sync_count
+        sync_count += 1
+        if sync_count == 2:
+            assert not destination.exists(), "drifted destination was not moved before sync"
+        _fixture_agent_environment(destination)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        builder,
+        "_read_distribution_inventory",
+        lambda python: ("aisle==0.1.0", "pytest==9.0.0"),
+    )
+    assert builder.build_agent_environment(repo, destination, runner=fake_runner)["ok"] is True
+    drifted = destination / "bin" / "ruff"
+    drifted.write_text("#!/agent-env/bin/python\n")
+    drifted.chmod(drifted.stat().st_mode | stat.S_IXUSR)
+
+    result = builder.build_agent_environment(repo, destination, runner=fake_runner)
+
+    assert result["ok"] is True
+    assert sync_count == 2
+    quarantine = destination.parent / ".s1-agent-env-quarantine"
+    quarantined = tuple(quarantine.iterdir())
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "bin" / "ruff").is_file()
+    assert not (destination / "bin" / "ruff").exists()
+
+
+def test_agent_environment_refuses_host_venv_as_destination_without_runner(
+    tmp_path: Path,
+):
+    """CON-1, CON-7: the repository host simulation environment is never a build target."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    host_venv = repo / ".venv"
+    host_venv.mkdir()
+    marker = host_venv / "cuda-marker"
+    marker.write_bytes(b"unchanged")
+
+    def forbidden_runner(command, *, cwd, env):
+        raise AssertionError("runner must not be called for the host .venv")
+
+    result = builder.build_agent_environment(repo, host_venv, runner=forbidden_runner)
+
+    assert result == {"code": "DESTINATION_NOT_ISOLATED", "ok": False}
+    assert marker.read_bytes() == b"unchanged"
+
+
+def test_agent_environment_requires_controller_owned_destination_parent(
+    tmp_path: Path, monkeypatch
+):
+    """CON-7: an environment target outside controller ownership is refused before sync."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = tmp_path / "controller-environments" / "s1"
+    monkeypatch.setattr(builder.os, "getuid", lambda: -1)
+
+    def forbidden_runner(command, *, cwd, env):
+        raise AssertionError("runner must not be called for an unowned destination")
+
+    result = builder.build_agent_environment(repo, destination, runner=forbidden_runner)
+
+    assert result == {"code": "DESTINATION_NOT_OWNED", "ok": False}
+
+
+def test_agent_environment_sync_and_inventory_failures_have_stable_codes(
+    tmp_path: Path, monkeypatch
+):
+    """CON-7, CON-8: external sync and malformed post-sync inventory fail closed."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = tmp_path / "controller-environments" / "s1"
+
+    def failed_runner(command, *, cwd, env):
+        return subprocess.CompletedProcess(command, 23, "", "fixture failure")
+
+    assert builder.build_agent_environment(repo, destination, runner=failed_runner) == {
+        "code": "SYNC_FAILED",
+        "ok": False,
+    }
+    assert builder.build_agent_environment(
+        repo,
+        destination,
+        runner=lambda command, *, cwd, env: object(),
+    ) == {
+        "code": "SYNC_FAILED",
+        "ok": False,
+    }
+
+    def malformed_runner(command, *, cwd, env):
+        _fixture_agent_environment(destination)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        builder,
+        "_read_distribution_inventory",
+        lambda python: ("missing-version-separator",),
+    )
+    assert builder.build_agent_environment(repo, destination, runner=malformed_runner) == {
+        "code": "INVENTORY_MALFORMED",
+        "ok": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_ok"),
+    [
+        (["--help"], True),
+        ([], False),
+        (["--repo", "/tmp/repo-only"], False),
+    ],
+)
+def test_agent_environment_cli_argument_paths_are_one_json_object(
+    argv: list[str], expected_ok: bool
+):
+    """CON-8: help and argument refusals emit one JSON object with matching exit status."""
+    from tools import build_s1_agent_env as builder
+
+    stdout = StringIO()
+    with redirect_stdout(stdout):
+        returncode = builder.main(argv)
+    response = json.loads(stdout.getvalue())
+
+    assert response["ok"] is expected_ok
+    assert returncode == (0 if expected_ok else 1)
+    assert stdout.getvalue().count("\n") == 1
+
+
+def test_agent_environment_cli_success_emits_only_public_attestation(tmp_path: Path, monkeypatch):
+    """CON-5, CON-8: CLI success returns one minimal environment attestation object."""
+    from tools import build_s1_agent_env as builder
+
+    repo = tmp_path / "repo"
+    destination = tmp_path / "agent-env"
+    monkeypatch.setattr(
+        builder,
+        "build_agent_environment",
+        lambda selected_repo, selected_destination, runner: {
+            "ok": True,
+            "reused": False,
+            "environment": str(destination),
+            "lock_sha256": "a" * 64,
+            "inventory_sha256": "b" * 64,
+            "builder_sha256": "c" * 64,
+        },
+    )
+    stdout = StringIO()
+
+    with redirect_stdout(stdout):
+        returncode = builder.main(["--repo", str(repo), "--out", str(destination)])
+
+    assert returncode == 0
+    assert json.loads(stdout.getvalue()) == {
+        "ok": True,
+        "environment": str(destination),
+        "lock_sha256": "a" * 64,
+        "inventory_sha256": "b" * 64,
+    }
     assert stdout.getvalue().count("\n") == 1
 
 
