@@ -2666,21 +2666,30 @@ def _fixture_agent_environment(destination: Path) -> Path:
     return python
 
 
+def _fixture_agent_repository(tmp_path: Path) -> Path:
+    repo = tmp_path / "controller" / ".worktrees" / "session"
+    repo.mkdir(parents=True)
+    (repo / "uv.lock").write_bytes(b"fixture-lock\n")
+    (repo / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='0.0.0'\n")
+    return repo
+
+
+def _fixture_agent_destination(repo: Path, name: str = "s1-fixture") -> Path:
+    return repo.parents[1] / ".s1-agent-environments" / name
+
+
 def test_agent_environment_sync_targets_only_explicit_isolated_destination(
     tmp_path: Path, monkeypatch
 ):
     """CON-1, CON-5, CON-7: default+dev sync targets only the controller-owned agent env."""
     from tools import build_s1_agent_env as builder
 
-    repo = tmp_path / "assigned-session-worktree"
-    repo.mkdir()
-    (repo / "uv.lock").write_bytes(b"fixture-lock\n")
-    (repo / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='0.0.0'\n")
-    host_venv = repo / ".venv"
+    repo = _fixture_agent_repository(tmp_path)
+    host_venv = repo.parents[1] / ".venv"
     host_venv.mkdir()
     host_marker = host_venv / "host-cuda-environment"
     host_marker.write_bytes(b"must-not-change")
-    destination = tmp_path / "controller-agent-environments" / "s1"
+    destination = _fixture_agent_destination(repo)
     calls = []
 
     def fake_runner(command, *, cwd, env):
@@ -2803,7 +2812,15 @@ def test_agent_environment_inspection_returns_canonical_inventory(tmp_path: Path
     )
 
 
-@pytest.mark.parametrize("distribution", ["!invalid==1.0", "aisle==1.0==forged"])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        "!invalid==1.0",
+        "aisle==1.0==forged",
+        "aisle==not a version",
+        "aisle==1.0+",
+    ],
+)
 def test_agent_environment_inspection_rejects_malformed_distribution_entries(
     tmp_path: Path, monkeypatch, distribution: str
 ):
@@ -2824,20 +2841,12 @@ def test_agent_environment_inspection_rejects_malformed_distribution_entries(
     assert raised.value.code == "INVENTORY_MALFORMED"
 
 
-def _fixture_agent_repository(tmp_path: Path) -> Path:
-    repo = tmp_path / "assigned-session-worktree"
-    repo.mkdir()
-    (repo / "uv.lock").write_bytes(b"fixture-lock\n")
-    (repo / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='0.0.0'\n")
-    return repo
-
-
 def test_agent_environment_matching_attestation_is_reused_without_sync(tmp_path: Path, monkeypatch):
     """CON-5, CON-7: an exact live inventory and provenance match is reused unchanged."""
     from tools import build_s1_agent_env as builder
 
     repo = _fixture_agent_repository(tmp_path)
-    destination = tmp_path / "controller-environments" / "s1"
+    destination = _fixture_agent_destination(repo)
     sync_calls = []
 
     def fake_runner(command, *, cwd, env):
@@ -2866,7 +2875,7 @@ def test_agent_environment_inspection_reports_attested_lock_after_build(
     from tools import build_s1_agent_env as builder
 
     repo = _fixture_agent_repository(tmp_path)
-    destination = tmp_path / "controller-environments" / "s1"
+    destination = _fixture_agent_destination(repo)
 
     def fake_runner(command, *, cwd, env):
         _fixture_agent_environment(destination)
@@ -2890,7 +2899,7 @@ def test_agent_environment_lock_drift_is_quarantined_before_rebuild(tmp_path: Pa
     from tools import build_s1_agent_env as builder
 
     repo = _fixture_agent_repository(tmp_path)
-    destination = tmp_path / "controller-environments" / "s1"
+    destination = _fixture_agent_destination(repo)
     sync_count = 0
 
     def fake_runner(command, *, cwd, env):
@@ -2921,6 +2930,73 @@ def test_agent_environment_lock_drift_is_quarantined_before_rebuild(tmp_path: Pa
     assert (destination / "generation").read_text() == "2"
 
 
+def test_agent_environment_lock_mutation_during_sync_returns_lock_drift_and_quarantines(
+    tmp_path: Path, monkeypatch
+):
+    """CON-5, CON-7: a sync cannot attest bytes from a lock that changed during execution."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = _fixture_agent_destination(repo)
+
+    def mutating_runner(command, *, cwd, env):
+        _fixture_agent_environment(destination)
+        (destination / "sync-finished").write_text("preserve me")
+        (repo / "uv.lock").write_bytes(b"mutated-during-sync\n")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        builder,
+        "_read_distribution_inventory",
+        lambda python: ("aisle==0.1.0", "pytest==9.0.0"),
+    )
+
+    result = builder.build_agent_environment(repo, destination, runner=mutating_runner)
+
+    assert result == {"code": "LOCK_DRIFT", "ok": False}
+    assert not destination.exists()
+    quarantined = tuple((destination.parent / ".s1-agent-env-quarantine").iterdir())
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "sync-finished").read_text() == "preserve me"
+
+
+def test_agent_environment_reuse_rechecks_lock_before_returning(tmp_path: Path, monkeypatch):
+    """CON-5, CON-7: a reuse-time lock race cannot return a stale matching attestation."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = _fixture_agent_destination(repo)
+    sync_calls = 0
+
+    def fake_runner(command, *, cwd, env):
+        nonlocal sync_calls
+        sync_calls += 1
+        _fixture_agent_environment(destination)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        builder,
+        "_read_distribution_inventory",
+        lambda python: ("aisle==0.1.0", "pytest==9.0.0"),
+    )
+    assert builder.build_agent_environment(repo, destination, runner=fake_runner)["ok"] is True
+    real_inspection = builder.inspect_agent_environment
+
+    def mutating_inspection(path):
+        inspected = real_inspection(path)
+        (repo / "uv.lock").write_bytes(b"mutated-during-reuse\n")
+        return inspected
+
+    monkeypatch.setattr(builder, "inspect_agent_environment", mutating_inspection)
+
+    result = builder.build_agent_environment(repo, destination, runner=fake_runner)
+
+    assert result == {"code": "LOCK_DRIFT", "ok": False}
+    assert sync_calls == 1
+    assert not destination.exists()
+    assert len(tuple((destination.parent / ".s1-agent-env-quarantine").iterdir())) == 1
+
+
 def test_agent_environment_inventory_drift_is_quarantined_before_rebuild(
     tmp_path: Path, monkeypatch
 ):
@@ -2928,7 +3004,7 @@ def test_agent_environment_inventory_drift_is_quarantined_before_rebuild(
     from tools import build_s1_agent_env as builder
 
     repo = _fixture_agent_repository(tmp_path)
-    destination = tmp_path / "controller-environments" / "s1"
+    destination = _fixture_agent_destination(repo)
     sync_count = 0
 
     def fake_runner(command, *, cwd, env):
@@ -2960,17 +3036,19 @@ def test_agent_environment_inventory_drift_is_quarantined_before_rebuild(
     assert not (destination / "bin" / "ruff").exists()
 
 
-def test_agent_environment_refuses_host_venv_as_destination_without_runner(
-    tmp_path: Path,
+@pytest.mark.parametrize("venv_location", ["controller", "session"])
+def test_agent_environment_refuses_every_host_venv_without_runner_or_quarantine(
+    tmp_path: Path, monkeypatch, venv_location: str
 ):
-    """CON-1, CON-7: the repository host simulation environment is never a build target."""
+    """CON-1, CON-7: host and worktree simulation envs are never build/quarantine targets."""
     from tools import build_s1_agent_env as builder
 
     repo = _fixture_agent_repository(tmp_path)
-    host_venv = repo / ".venv"
+    host_venv = repo.parents[1] / ".venv" if venv_location == "controller" else repo / ".venv"
     host_venv.mkdir()
     marker = host_venv / "cuda-marker"
     marker.write_bytes(b"unchanged")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(host_venv))
 
     def forbidden_runner(command, *, cwd, env):
         raise AssertionError("runner must not be called for the host .venv")
@@ -2979,6 +3057,73 @@ def test_agent_environment_refuses_host_venv_as_destination_without_runner(
 
     assert result == {"code": "DESTINATION_NOT_ISOLATED", "ok": False}
     assert marker.read_bytes() == b"unchanged"
+    assert host_venv.is_dir()
+    assert not (host_venv.parent / ".s1-agent-env-quarantine").exists()
+
+
+def test_agent_environment_rejects_symlink_alias_to_host_venv_without_mutation(
+    tmp_path: Path, monkeypatch
+):
+    """CON-7: a permitted-root symlink cannot alias the controller CUDA environment."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    host_venv = repo.parents[1] / ".venv"
+    host_venv.mkdir()
+    marker = host_venv / "cuda-marker"
+    marker.write_bytes(b"unchanged")
+    agent_root = _fixture_agent_destination(repo).parent
+    agent_root.mkdir()
+    alias = agent_root / "s1-alias"
+    alias.symlink_to(host_venv, target_is_directory=True)
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(host_venv))
+
+    def forbidden_runner(command, *, cwd, env):
+        raise AssertionError("runner must not be called for an aliased host .venv")
+
+    result = builder.build_agent_environment(repo, alias, runner=forbidden_runner)
+
+    assert result == {"code": "DESTINATION_NOT_ISOLATED", "ok": False}
+    assert alias.is_symlink()
+    assert host_venv.is_dir()
+    assert marker.read_bytes() == b"unchanged"
+
+
+def test_agent_environment_rejects_active_host_uv_environment_even_under_agent_root(
+    tmp_path: Path, monkeypatch
+):
+    """CON-7: the builder cannot replace the environment active in its host process."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = _fixture_agent_destination(repo)
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(destination))
+
+    def forbidden_runner(command, *, cwd, env):
+        raise AssertionError("runner must not target the active host environment")
+
+    result = builder.build_agent_environment(repo, destination, runner=forbidden_runner)
+
+    assert result == {"code": "DESTINATION_NOT_ISOLATED", "ok": False}
+    assert not destination.exists()
+
+
+def test_agent_environment_rejects_same_uid_destination_outside_dedicated_root(
+    tmp_path: Path,
+):
+    """CON-7: same-UID ownership alone does not grant environment or quarantine authority."""
+    from tools import build_s1_agent_env as builder
+
+    repo = _fixture_agent_repository(tmp_path)
+    destination = tmp_path / "same-uid-but-untrusted" / "s1"
+
+    def forbidden_runner(command, *, cwd, env):
+        raise AssertionError("runner must not target an arbitrary same-UID path")
+
+    result = builder.build_agent_environment(repo, destination, runner=forbidden_runner)
+
+    assert result == {"code": "DESTINATION_NOT_ISOLATED", "ok": False}
+    assert not destination.exists()
 
 
 def test_agent_environment_requires_controller_owned_destination_parent(
@@ -2988,7 +3133,7 @@ def test_agent_environment_requires_controller_owned_destination_parent(
     from tools import build_s1_agent_env as builder
 
     repo = _fixture_agent_repository(tmp_path)
-    destination = tmp_path / "controller-environments" / "s1"
+    destination = _fixture_agent_destination(repo)
     monkeypatch.setattr(builder.os, "getuid", lambda: -1)
 
     def forbidden_runner(command, *, cwd, env):
@@ -3006,7 +3151,7 @@ def test_agent_environment_sync_and_inventory_failures_have_stable_codes(
     from tools import build_s1_agent_env as builder
 
     repo = _fixture_agent_repository(tmp_path)
-    destination = tmp_path / "controller-environments" / "s1"
+    destination = _fixture_agent_destination(repo)
 
     def failed_runner(command, *, cwd, env):
         return subprocess.CompletedProcess(command, 23, "", "fixture failure")

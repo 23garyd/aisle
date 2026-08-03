@@ -29,6 +29,8 @@ print(json.dumps(sorted(items)))
 """
 _FORBIDDEN_DISTRIBUTIONS = frozenset({"genesis-world", "dora-rs", "torch"})
 _FORBIDDEN_EXECUTABLES = frozenset({"dora", "genesis"})
+_AGENT_ENV_ROOT_NAME = ".s1-agent-environments"
+_ENVIRONMENT_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,18 @@ def _normalized_distribution(item: str) -> str:
         raise AgentEnvironmentError(
             "INVENTORY_MALFORMED", "distribution inventory entry is malformed"
         )
+    try:
+        from packaging.version import InvalidVersion, Version
+    except ImportError as error:
+        raise AgentEnvironmentError(
+            "INVENTORY_MALFORMED", "PEP 440 version validation is unavailable"
+        ) from error
+    try:
+        Version(version)
+    except InvalidVersion as error:
+        raise AgentEnvironmentError(
+            "INVENTORY_MALFORMED", "distribution version is not valid PEP 440"
+        ) from error
     normalized = re.sub(r"[-_.]+", "-", name).lower()
     if not normalized:
         raise AgentEnvironmentError(
@@ -231,31 +245,70 @@ def _validate_build_paths(repo: Path, destination: Path) -> tuple[Path, Path, Pa
         raise AgentEnvironmentError(
             "INVALID_ARGUMENT", "repo and destination must be explicit absolute paths"
         )
+    requested_destination = destination
     repo = repo.resolve(strict=True)
-    destination = destination.resolve(strict=False)
+    destination = requested_destination.resolve(strict=False)
     if not repo.is_dir():
         raise AgentEnvironmentError("INVALID_ARGUMENT", "repo must be a directory")
-    if destination == repo or destination.is_relative_to(repo):
+    controller_root = repo.parent.parent if repo.parent.name == ".worktrees" else repo
+    worktrees_root = controller_root / ".worktrees"
+    agent_environment_root = controller_root / _AGENT_ENV_ROOT_NAME
+    if (
+        requested_destination != destination
+        or destination.parent != agent_environment_root
+        or _ENVIRONMENT_NAME_PATTERN.fullmatch(destination.name) is None
+        or destination == controller_root / ".venv"
+        or destination == repo / ".venv"
+        or destination.is_relative_to(worktrees_root)
+    ):
         raise AgentEnvironmentError(
-            "DESTINATION_NOT_ISOLATED", "destination must be outside the repository worktree"
+            "DESTINATION_NOT_ISOLATED",
+            "destination must be one canonical child of the dedicated agent-environment root",
         )
-    ownership_boundary = destination
-    while not ownership_boundary.exists():
-        parent = ownership_boundary.parent
-        if parent == ownership_boundary:
+    configured_host_environment = os.environ.get("UV_PROJECT_ENVIRONMENT")
+    if configured_host_environment:
+        try:
+            host_environment = Path(configured_host_environment).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError):
             raise AgentEnvironmentError(
-                "DESTINATION_NOT_OWNED", "destination has no existing ownership boundary"
+                "DESTINATION_NOT_ISOLATED", "host UV_PROJECT_ENVIRONMENT is malformed"
+            ) from None
+        if destination == host_environment:
+            raise AgentEnvironmentError(
+                "DESTINATION_NOT_ISOLATED",
+                "destination cannot be the active host UV_PROJECT_ENVIRONMENT",
             )
-        ownership_boundary = parent
-    if ownership_boundary.stat().st_uid != os.getuid():
+    ownership_boundary = (
+        agent_environment_root if agent_environment_root.exists() else controller_root
+    )
+    if (
+        ownership_boundary.is_symlink()
+        or not ownership_boundary.is_dir()
+        or ownership_boundary.stat().st_uid != os.getuid()
+    ):
         raise AgentEnvironmentError(
             "DESTINATION_NOT_OWNED",
-            "destination or its nearest existing parent must be controller-owned",
+            "dedicated agent-environment root must be controller-owned",
         )
     lock = repo / "uv.lock"
     if not lock.is_file():
         raise AgentEnvironmentError("LOCK_MISSING", "repository uv.lock is unavailable")
     return repo, destination, lock
+
+
+def _prepare_agent_environment_root(destination: Path) -> None:
+    root = destination.parent
+    try:
+        root.mkdir(mode=0o700, exist_ok=True)
+        root_stat = root.stat()
+    except OSError as error:
+        raise AgentEnvironmentError(
+            "DESTINATION_NOT_OWNED", "could not create dedicated agent-environment root"
+        ) from error
+    if root.is_symlink() or not root.is_dir() or root_stat.st_uid != os.getuid():
+        raise AgentEnvironmentError(
+            "DESTINATION_NOT_OWNED", "dedicated agent-environment root is not controller-owned"
+        )
 
 
 def _write_manifest(destination: Path, provenance: dict) -> None:
@@ -298,11 +351,27 @@ def _quarantine_destination(destination: Path, evidence: bytes) -> str | None:
     return None
 
 
+def _lock_matches(lock: Path, expected_sha256: str) -> bool:
+    try:
+        return _sha256_file(lock) == expected_sha256
+    except OSError:
+        return False
+
+
+def _lock_drift_result(destination: Path, lock_sha256: str) -> dict:
+    if destination.exists():
+        _, manifest_bytes = _read_manifest(destination)
+        evidence = manifest_bytes or f"lock-drift:{lock_sha256}".encode()
+        _quarantine_destination(destination, evidence)
+    return {"code": "LOCK_DRIFT", "ok": False}
+
+
 def build_agent_environment(repo: Path, destination: Path, *, runner: Callable) -> dict:
     """Synchronize and attest one explicit non-simulation agent environment."""
 
     try:
         repo, destination, lock = _validate_build_paths(repo, destination)
+        _prepare_agent_environment_root(destination)
     except (AgentEnvironmentError, OSError) as error:
         code = error.code if isinstance(error, AgentEnvironmentError) else "INVALID_ARGUMENT"
         return {"code": code, "ok": False}
@@ -319,12 +388,16 @@ def build_agent_environment(repo: Path, destination: Path, *, runner: Callable) 
             current_provenance = _provenance(destination, current_spec, lock_sha256)
         except (AgentEnvironmentError, OSError):
             current_provenance = None
+        if not _lock_matches(lock, lock_sha256):
+            return _lock_drift_result(destination, lock_sha256)
         if current_provenance is not None and manifest == current_provenance:
             return {"ok": True, "reused": True, **current_provenance}
         quarantine_error = _quarantine_destination(destination, manifest_bytes)
         if quarantine_error is not None:
             return {"code": quarantine_error, "ok": False}
 
+    if not _lock_matches(lock, lock_sha256):
+        return _lock_drift_result(destination, lock_sha256)
     environment = os.environ.copy()
     environment["UV_PROJECT_ENVIRONMENT"] = str(destination)
     command = ["uv", "sync", "--frozen", "--no-extra", "sim", "--group", "dev"]
@@ -332,17 +405,26 @@ def build_agent_environment(repo: Path, destination: Path, *, runner: Callable) 
         completed = runner(command, cwd=repo, env=environment)
     except OSError:
         return {"code": "SYNC_FAILED", "ok": False}
+    if not _lock_matches(lock, lock_sha256):
+        return _lock_drift_result(destination, lock_sha256)
     if type(getattr(completed, "returncode", None)) is not int or completed.returncode != 0:
         return {"code": "SYNC_FAILED", "ok": False}
 
     try:
         inspected = inspect_agent_environment(destination)
-        provenance = _provenance(destination, inspected, lock_sha256)
-        _write_manifest(destination, provenance)
     except AgentEnvironmentError as error:
         return {"code": error.code, "ok": False}
     except OSError:
         return {"code": "INVENTORY_MALFORMED", "ok": False}
+    if not _lock_matches(lock, lock_sha256):
+        return _lock_drift_result(destination, lock_sha256)
+    try:
+        provenance = _provenance(destination, inspected, lock_sha256)
+        _write_manifest(destination, provenance)
+    except OSError:
+        return {"code": "INVENTORY_MALFORMED", "ok": False}
+    if not _lock_matches(lock, lock_sha256):
+        return _lock_drift_result(destination, lock_sha256)
 
     return {"ok": True, "reused": False, **provenance}
 
