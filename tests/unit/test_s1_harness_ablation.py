@@ -1212,6 +1212,16 @@ def test_script_adapter_preflight_failure_measures_elapsed_wall_time(tmp_path: P
     assert result.to_dict() == {"ok": False, "errors": [{"code": "INFRA_TIMEOUT"}], "wall_s": 0.75}
 
 
+def _fixture_sandbox_identity(pid: int = 987_654_321) -> dict[str, int | str]:
+    return {
+        "kind": "process_group",
+        "leader_pid": pid,
+        "leader_starttime_ticks": 123,
+        "process_group_id": pid,
+        "pid_namespace_inode": 456,
+    }
+
+
 def _controller_runtime(
     module,
     *,
@@ -1275,6 +1285,7 @@ def _controller_runtime(
                         returncode=-signal.SIGKILL,
                         wall_s=0.25,
                         agent_version="fixture-agent-1",
+                        sandbox_identity=_fixture_sandbox_identity(),
                     )
         except module.TelemetryError:
             return module.ExecutionResult(
@@ -1282,12 +1293,14 @@ def _controller_runtime(
                 returncode=-signal.SIGKILL,
                 wall_s=0.25,
                 agent_version="fixture-agent-1",
+                sandbox_identity=_fixture_sandbox_identity(),
             )
         return module.ExecutionResult(
             stopped="agent_done",
             returncode=0,
             wall_s=0.25,
             agent_version="fixture-agent-1",
+            sandbox_identity=_fixture_sandbox_identity(),
         )
 
     return module.ControllerRuntime(
@@ -1338,7 +1351,8 @@ def _invoke_controller(module, argv: list[str], runtime) -> tuple[int, dict, str
 def _prepare_controller_campaign(module, tmp_path: Path, *, pairs: int = 1, runtime=None):
     campaign = tmp_path / "campaign"
     runtime = runtime or _controller_runtime(module)
-    runtime = replace(runtime, worktrees_root=tmp_path / "controller-worktrees")
+    if runtime.worktrees_root is None:
+        runtime = replace(runtime, worktrees_root=tmp_path / "controller-worktrees")
     returncode, result, _, _ = _invoke_controller(
         module,
         [
@@ -1412,6 +1426,7 @@ def test_controller_prepare_is_deterministic_paired_and_copies_only_assigned_sur
         left_record = json.loads((left / "session.json").read_text())
         right_record = json.loads((right / "session.json").read_text())
         for field in (
+            "session_id",
             "worktrees_root",
             "worktrees_root_sha256",
             "worktree",
@@ -1434,9 +1449,12 @@ def test_controller_prepare_is_deterministic_paired_and_copies_only_assigned_sur
             "audit.json",
             "attempt.lock",
             "score.lock",
+            "trusted-source-manifest.json",
         }
+        assert (session_dir / "trusted-source").is_dir()
         worktree = Path(record["worktree"])
         assert worktree.parent == tmp_path / "first" / "controller-worktrees"
+        assert worktree.name == record["session_id"] == session_dir.name
         assert record["worktree_path_sha256"]
         aisle_candidate = worktree / "graphs" / "agent_s1_ablation.yaml"
         script_candidate = worktree / "baselines" / "script_s1" / "candidate.py"
@@ -1496,7 +1514,7 @@ def test_controller_condition_is_immutable_after_session_start(tmp_path: Path):
     campaign, result, runtime = _prepare_controller_campaign(controller, tmp_path)
     session_dir = campaign / result["sessions"][0]
     returncode, response, _, _ = _run_prepared_controller_session(controller, session_dir, runtime)
-    assert returncode == 0 and response["ok"] is True
+    assert returncode == 0 and response["ok"] is True, response
     assigned = json.loads((session_dir / "session.json").read_text())["condition"]
 
     returncode, response, _, _ = _invoke_controller(
@@ -1734,6 +1752,9 @@ def test_controller_scores_all_eight_heldout_seeds_and_clean_audit_passes(tmp_pa
     )
     assert returncode == 0
     assert response["pass1"] == 0.5
+    scored_session = json.loads((session_dir / "session.json").read_text())
+    scoring_cleanup = scored_session["scoring_admission"]["adapter_cleanup"]
+    assert controller._adapter_cleanup_valid(scoring_cleanup, runtime) is True
 
     returncode, response, _, _ = _invoke_controller(
         controller,
@@ -1767,6 +1788,67 @@ def test_controller_audit_fails_closed_when_trusted_run_components_disappear(tmp
     assert response["ok"] is False
     audit = json.loads((session_dir / "audit.json").read_text())
     assert "ISOLATION_HASH_DRIFT" in audit["issues"]
+
+
+def test_process_group_inspection_detects_descendant_after_parent_exit(tmp_path: Path):
+    """CON-7: a missing group leader does not hide a surviving descendant."""
+    from tools import s1_harness_ablation as controller
+
+    proc_root = tmp_path / "proc"
+    child = proc_root / "101"
+    (child / "ns").mkdir(parents=True)
+    tail = ["S", "1", "100", *(["0"] * 16), "222"]
+    (child / "stat").write_text(f"101 (fixture child) {' '.join(tail)}\n")
+    (child / "ns" / "pid").write_text("fixture namespace\n")
+    identity = {
+        "kind": "process_group",
+        "leader_pid": 100,
+        "leader_starttime_ticks": 111,
+        "process_group_id": 100,
+        "pid_namespace_inode": (child / "ns" / "pid").stat().st_ino,
+    }
+
+    evidence = controller._inspect_owned_identity(
+        identity,
+        proc_root=proc_root,
+        checked_at_epoch=1_800_000_010.0,
+    )
+
+    assert evidence["status"] == "surviving"
+    assert evidence["observed"] == [
+        {
+            "pid": 101,
+            "starttime_ticks": 222,
+            "pid_namespace_inode": (child / "ns" / "pid").stat().st_ino,
+        }
+    ]
+
+
+def test_controller_audit_rejects_forged_cleanup_booleans(tmp_path: Path):
+    """CON-7: persisted true flags are not independently verified cleanup evidence."""
+    from tools import s1_harness_ablation as controller
+
+    campaign, result, runtime = _prepare_controller_campaign(controller, tmp_path)
+    session_dir = campaign / result["sessions"][0]
+    _run_prepared_controller_session(controller, session_dir, runtime)
+    session = json.loads((session_dir / "session.json").read_text())
+    session["isolation_cleanup"] = {
+        "broker_stopped": True,
+        "credential_revoked": True,
+        "socket_removed": True,
+        "process_group_clean": True,
+    }
+    (session_dir / "session.json").write_text(json.dumps(session))
+
+    returncode, response, _, _ = _invoke_controller(
+        controller,
+        ["audit", "--dir", str(session_dir)],
+        runtime,
+    )
+
+    assert returncode == 1
+    assert response["ok"] is False
+    assert "SANDBOX_CLEANUP_INVALID" in response["sessions"][0]["issues"]
 
 
 def test_controller_audit_marks_operator_and_frozen_contamination_without_process_claims(
@@ -2014,6 +2096,7 @@ def test_controller_supervises_dev_attempts_through_assigned_adapter_and_correla
             returncode=0,
             wall_s=0.25,
             agent_version="fixture-agent-1",
+            sandbox_identity=_fixture_sandbox_identity(),
         )
 
     runtime = replace(
@@ -2032,19 +2115,20 @@ def test_controller_supervises_dev_attempts_through_assigned_adapter_and_correla
     assert attempt["attempt_id"] == nested_responses[0]["attempt_id"]
     assert [episode["seed"] for episode in attempt["episodes"]] == [0, 1]
     session = json.loads((session_dir / "session.json").read_text())
+    snapshot = session_dir / "attempt-snapshots" / nested_responses[0]["attempt_id"]
+    snapshot_candidate = snapshot / Path(session["candidate"]).relative_to(
+        Path(session["worktree"])
+    )
     assert adapter_calls == [
         (
             session["condition"],
-            session_dir / session["candidate"],
+            snapshot_candidate,
             "0,1",
             nested_responses[0]["attempt_id"],
         )
     ]
     controller_manifest = (
-        _controller_session_worktree(session_dir)
-        / "runs"
-        / nested_responses[0]["attempt_id"]
-        / "controller_attempt.json"
+        snapshot / "runs" / nested_responses[0]["attempt_id"] / "controller_attempt.json"
     )
     assert controller_manifest.is_file()
 
@@ -2057,6 +2141,8 @@ def test_controller_supervises_dev_attempts_through_assigned_adapter_and_correla
     assert response["ok"] is True
     assert response["sessions"][0]["development_episodes"] == 2
 
+    controller_manifest.parent.chmod(0o700)
+    controller_manifest.chmod(0o600)
     controller_manifest.unlink()
     returncode, response, _, _ = _invoke_controller(
         controller,
@@ -2065,6 +2151,214 @@ def test_controller_supervises_dev_attempts_through_assigned_adapter_and_correla
     )
     assert returncode == 1
     assert "ATTEMPT_CORRELATION_INVALID" in response["sessions"][0]["issues"]
+
+
+def test_candidate_fd_capture_binds_opened_bytes_when_writable_path_is_replaced(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """CON-7: candidate capture attributes one no-follow descriptor, never a second path read."""
+    from tools import s1_harness_ablation as controller
+
+    worktree = tmp_path / "worktree"
+    candidate = worktree / "candidate.yaml"
+    candidate.parent.mkdir()
+    candidate.write_bytes(b"opened candidate bytes\n")
+    original_inode = candidate.stat().st_ino
+    real_read = controller.os.read
+    replaced = False
+
+    def replace_after_first_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        chunk = real_read(descriptor, size)
+        if not replaced:
+            replaced = True
+            candidate.unlink()
+            candidate.write_bytes(b"replacement bytes\n")
+        return chunk
+
+    monkeypatch.setattr(controller.os, "read", replace_after_first_read)
+
+    captured = controller._capture_candidate_fd(worktree, "candidate.yaml")
+
+    assert captured.bytes_value == b"opened candidate bytes\n"
+    assert captured.inode == original_inode
+    assert captured.inode != candidate.stat().st_ino
+    assert captured.sha256 == ("34c19d59b71614b7088e62bd8bbf9752cd6d7c6e4ddf307df4143c7fb2d8d523")
+
+
+def test_trusted_source_copy_handles_partial_descriptor_writes(tmp_path: Path, monkeypatch):
+    """CON-7: a short kernel write cannot silently truncate the trusted template."""
+    from tools import s1_harness_ablation as controller
+
+    source = tmp_path / "source"
+    source.mkdir()
+    expected = b"trusted source bytes" * 100
+    (source / "module.py").write_bytes(expected)
+    destination = tmp_path / "destination"
+    real_write = controller.os.write
+
+    def partial_write(descriptor: int, value: bytes) -> int:
+        return real_write(descriptor, value[: max(1, len(value) // 2)])
+
+    monkeypatch.setattr(controller.os, "write", partial_write)
+
+    controller._copy_source_tree(source, destination)
+
+    assert (destination / "module.py").read_bytes() == expected
+
+
+def test_authorized_attempt_runs_from_readonly_trusted_snapshot_despite_agent_mutation(
+    tmp_path: Path,
+):
+    """CON-7: post-admission agent writes cannot change adapter source or attribution."""
+    from aisle.harness.ablation import (
+        AttemptResult,
+        PreflightResult,
+        SafetyResult,
+        sha256_file,
+    )
+    from tools import s1_harness_ablation as controller
+    from tools import s1_harness_attempt_client as client
+
+    observed: list[tuple[Path, Path, bytes]] = []
+    original_candidate: Path | None = None
+
+    class SnapshotAdapter:
+        def __init__(self, root: Path):
+            self.root = root
+
+        def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
+            observed.append((self.root, candidate, candidate.read_bytes()))
+            return AttemptResult(
+                attempt_id=run_id,
+                candidate_hash=sha256_file(candidate),
+                preflight=PreflightResult(ok=True, errors=(), wall_s=0.0),
+                episodes=(_episode_record(0, 0),),
+                failures={"timeout": 1},
+                safety=SafetyResult(ungated=0, clamps=0, extra_item=0),
+                timing={"wall_s": 0.0, "sim_s": 0.0},
+                artifacts={},
+            )
+
+    def factory(condition: str, root: Path):
+        assert original_candidate is not None
+        original_candidate.write_bytes(b"agent mutation after admission\n")
+        return SnapshotAdapter(root)
+
+    runtime = _controller_runtime(controller, adapter_factory=factory)
+    session_dir, session, runtime = _running_broker_session(
+        controller,
+        tmp_path,
+        runtime,
+    )
+    worktree = Path(session["worktree"])
+    original_candidate = Path(session["candidate"])
+    authorized_bytes = b"authorized candidate bytes\n"
+    original_candidate.write_bytes(authorized_bytes)
+
+    with controller.AttemptBroker(session_dir, runtime) as broker:
+        request = client.build_request(
+            "0",
+            config_path=broker.endpoint.credential_path,
+            workspace=worktree,
+            nonce=1,
+            now_epoch=runtime.epoch_time(),
+        )
+        response = broker._response(request)
+
+    assert response["ok"] is True
+    attempt_id = response["attempt_id"]
+    snapshot = session_dir / "attempt-snapshots" / attempt_id
+    snapshot_candidate = snapshot / Path(session["candidate"]).relative_to(worktree)
+    assert observed == [(snapshot, snapshot_candidate, authorized_bytes)]
+    assert original_candidate.read_bytes() == b"agent mutation after admission\n"
+    assert stat.S_IMODE(snapshot_candidate.stat().st_mode) == 0o400
+    controller_manifest = snapshot / "runs" / attempt_id / "controller_attempt.json"
+    manifest = json.loads(controller_manifest.read_text())
+    assert manifest["candidate_sha256"] == sha256_file(snapshot_candidate)
+    assert manifest["snapshot_tree_sha256"]
+    assert manifest["trusted_template_sha256"] == session["trusted_template_sha256"]
+    admission = next(
+        entry["event"]
+        for entry in (
+            json.loads(line)
+            for line in (session_dir / "agent.jsonl").read_text().splitlines()
+            if line
+        )
+        if entry["event"].get("kind") == "dev_attempt_admit"
+    )
+    assert admission["snapshot_tree_sha256"] == manifest["snapshot_tree_sha256"]
+    assert admission["candidate_capture"]["inode"]
+
+
+def test_authorized_attempt_records_and_reaps_new_adapter_process_groups(tmp_path: Path):
+    """CON-7: adapter-owned child identity/starttime evidence is durable and absent."""
+    from aisle.harness.ablation import (
+        AttemptResult,
+        PreflightResult,
+        SafetyResult,
+        sha256_file,
+    )
+    from tools import s1_harness_ablation as controller
+    from tools import s1_harness_attempt_client as client
+
+    identity = _fixture_sandbox_identity(876_543_210)
+    descendant_snapshots = iter(((), (identity,)))
+    terminated: list[dict] = []
+
+    class Adapter:
+        def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
+            return AttemptResult(
+                attempt_id=run_id,
+                candidate_hash=sha256_file(candidate),
+                preflight=PreflightResult(ok=True, errors=(), wall_s=0.0),
+                episodes=(_episode_record(0, 0),),
+                failures={"timeout": 1},
+                safety=SafetyResult(ungated=0, clamps=0, extra_item=0),
+                timing={"wall_s": 0.0, "sim_s": 0.0},
+                artifacts={},
+            )
+
+    runtime = replace(
+        _controller_runtime(
+            controller,
+            adapter_factory=lambda condition, root: Adapter(),
+        ),
+        descendant_identities=lambda: next(descendant_snapshots),
+        terminate_owned_identity=lambda value: terminated.append(value),
+    )
+    session_dir, session, runtime = _running_broker_session(
+        controller,
+        tmp_path,
+        runtime,
+    )
+
+    with controller.AttemptBroker(session_dir, runtime) as broker:
+        request = client.build_request(
+            "0",
+            config_path=broker.endpoint.credential_path,
+            workspace=Path(session["worktree"]),
+            nonce=1,
+            now_epoch=runtime.epoch_time(),
+        )
+        response = broker._response(request)
+
+    assert response["ok"] is True
+    assert terminated == [identity]
+    attempt_id = response["attempt_id"]
+    controller_manifest = (
+        session_dir
+        / "attempt-snapshots"
+        / attempt_id
+        / "runs"
+        / attempt_id
+        / "controller_attempt.json"
+    )
+    cleanup = json.loads(controller_manifest.read_text())["adapter_cleanup"]
+    assert cleanup["identities"] == [identity]
+    assert cleanup["evidence"][0]["status"] == "absent"
+    assert cleanup["evidence_sha256"]
 
 
 def test_controller_attempt_channel_refuses_heldout_and_exhausted_dev_budget(tmp_path: Path):
@@ -2663,6 +2957,7 @@ def test_controller_token_overshoot_and_wall_stop_are_nonzero_terminal_outcomes(
             returncode=-signal.SIGKILL,
             wall_s=wall_ceiling_s,
             agent_version="fixture-agent-1",
+            sandbox_identity=_fixture_sandbox_identity(),
         )
 
     wall_runtime = replace(base_runtime, execute_agent=wall_executor)
@@ -2709,6 +3004,7 @@ def test_controller_unbrokered_simulator_observation_is_terminal_and_audited(
             returncode=-signal.SIGKILL,
             wall_s=0.1,
             agent_version="fixture-agent-1",
+            sandbox_identity=_fixture_sandbox_identity(),
         )
 
     runtime = replace(base_runtime, execute_agent=executor)
@@ -2778,6 +3074,11 @@ def test_controller_stdout_eof_without_process_exit_is_immediately_terminal(
     monkeypatch.setattr(controller.subprocess, "Popen", lambda *args, **kwargs: StuckAfterEof())
     monkeypatch.setattr(controller.os, "killpg", lambda pid, sig: killed.append(sig))
     monkeypatch.setattr(controller, "_agent_version", lambda agent: "fixture-agent-1")
+    monkeypatch.setattr(
+        controller,
+        "_capture_process_group_identity",
+        lambda pid: _fixture_sandbox_identity(pid),
+    )
 
     result = controller._execute_agent(
         ["fixture-agent"],
@@ -2925,6 +3226,70 @@ def test_attempt_client_rejects_candidate_symlink_escape(tmp_path: Path):
 
 
 @pytest.mark.parametrize(
+    ("seeds", "candidate_relpath"),
+    [
+        (",".join(str(value) for value in range(257)), "candidate.yaml"),
+        ("9" * 5000, "candidate.yaml"),
+        ("0", "nested/" + "a" * 5000),
+    ],
+)
+def test_attempt_client_bounds_outbound_fields_before_integer_or_socket_work(
+    tmp_path: Path,
+    seeds: str,
+    candidate_relpath: str,
+):
+    """CON-8: attacker-sized seed/path fields become stable client refusals."""
+    from tools import s1_harness_attempt_client as client
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = _attempt_client_config(
+        tmp_path / "credential.json",
+        candidate_relpath=candidate_relpath,
+    )
+
+    with pytest.raises(client.AttemptClientError) as raised:
+        client.build_request(
+            seeds,
+            config_path=config,
+            workspace=workspace,
+            nonce=1,
+            now_epoch=1_800_000_000.0,
+        )
+
+    assert type(raised.value) is client.AttemptClientError
+
+
+def test_attempt_client_rejects_oversized_encoded_request_before_connect(monkeypatch):
+    """CON-8: the complete outbound JSON is bounded before opening a socket."""
+    from tools import s1_harness_attempt_client as client
+
+    connected = False
+
+    def forbidden_socket(*args, **kwargs):
+        nonlocal connected
+        connected = True
+        raise AssertionError("oversized request reached socket construction")
+
+    monkeypatch.setattr(client.socket, "socket", forbidden_socket)
+    request = {
+        "protocol": 1,
+        "session_id": "S0001-fixture",
+        "condition": "aisle",
+        "nonce": 1,
+        "credential": "c" * 64,
+        "candidate_relpath": "candidate.yaml",
+        "candidate_sha256": "a" * 64,
+        "seeds": "0" * (1024 * 1024),
+    }
+
+    with pytest.raises(client.AttemptClientError, match="request"):
+        client._exchange(Path("/does/not/matter.sock"), request, 1.0)
+
+    assert connected is False
+
+
+@pytest.mark.parametrize(
     "encoded",
     [
         b'{"ok":true,"attempt_id":"A","episodes_used":1,"episodes_left":2,"extra":0}\n',
@@ -3064,10 +3429,12 @@ def test_sandboxed_run_uses_verified_bwrap_broker_and_namespace_probe_only(
     bwrap = tmp_path / "bwrap"
     bwrap.write_bytes(b"fixture-bwrap\n")
     built: list[tuple[object, list[str], dict[str, str]]] = []
+    runtime_modes: list[int] = []
     executed: list[tuple[list[str], dict[str, str]]] = []
 
     def build_argv(policy, command, environment):
         built.append((policy, list(command), dict(environment)))
+        runtime_modes.append(stat.S_IMODE(Path(policy.runtime_dir).stat().st_mode))
         return [str(bwrap), "--fixture-boundary", "--", *command]
 
     def execute_probe(command, cwd, environment, timeout):
@@ -3106,6 +3473,7 @@ def test_sandboxed_run_uses_verified_bwrap_broker_and_namespace_probe_only(
             returncode=0,
             wall_s=0.25,
             agent_version="fixture-agent",
+            sandbox_identity=_fixture_sandbox_identity(),
             process_group_clean=True,
         )
 
@@ -3146,7 +3514,8 @@ def test_sandboxed_run_uses_verified_bwrap_broker_and_namespace_probe_only(
     assert probe_command[0] == "/agent-env/bin/python"
     assert vendor_command[0] == "/opt/aisle/agent"
     assert "/opt/aisle/attempt-client --seeds <csv>" in " ".join(vendor_command)
-    assert Path(agent_policy.runtime_dir).stat().st_mode & 0o777 == 0o700
+    assert runtime_modes == [0o700, 0o700]
+    assert not Path(agent_policy.runtime_dir).exists()
     assert not Path(agent_policy.runtime_dir).is_relative_to(agent_policy.worktree)
     assert not Path(agent_policy.attempt_client).is_relative_to(agent_policy.worktree)
     assert executed and executed[0][0][0] == str(bwrap)
@@ -3154,7 +3523,22 @@ def test_sandboxed_run_uses_verified_bwrap_broker_and_namespace_probe_only(
 
     session = json.loads((session_dir / "session.json").read_text())
     evidence = session["isolation"]
+    cleanup = session["isolation_cleanup"]
     assert evidence["namespace_probe"] == _valid_native_sandbox_probe()
+    assert set(cleanup) == {
+        "schema_version",
+        "checked_at_epoch",
+        "sandbox",
+        "broker_thread",
+        "filesystem",
+        "evidence_sha256",
+    }
+    assert cleanup["sandbox"]["identity"] == _fixture_sandbox_identity()
+    assert cleanup["sandbox"]["status"] == "absent"
+    assert cleanup["broker_thread"]["status"] == "absent"
+    assert len(cleanup["filesystem"]) == 4
+    assert {item["status"] for item in cleanup["filesystem"]} == {"absent"}
+    assert controller._cleanup_evidence_valid(cleanup, runtime) is True
     for field in (
         "broker_sha256",
         "client_sha256",
@@ -3166,6 +3550,229 @@ def test_sandboxed_run_uses_verified_bwrap_broker_and_namespace_probe_only(
         "frozen_source_sha256",
     ):
         assert len(evidence[field]) == 64
+
+
+def test_sandboxed_run_stages_client_outside_protected_checkout_for_real_policy(
+    tmp_path: Path,
+    native_sandbox_worktrees_root: Path,
+    monkeypatch,
+):
+    """Native isolation design: the real policy mounts a verified private client copy."""
+    from aisle.harness import native_sandbox
+    from tools import build_s1_agent_env as environment_builder
+    from tools import s1_harness_ablation as controller
+
+    monkeypatch.setattr(native_sandbox, "_CONTROLLER_ROOT", controller.REPO_ROOT)
+    monkeypatch.setattr(
+        native_sandbox,
+        "_PROTECTED_SOURCES",
+        (
+            controller.REPO_ROOT,
+            native_sandbox_worktrees_root,
+            native_sandbox._HOST_SIMULATION_ENV,
+        ),
+    )
+    agent_env = tmp_path / "agent-environment"
+    (agent_env / "bin").mkdir(parents=True)
+    python = agent_env / "bin" / "python"
+    python.write_bytes(b"fixture-python\n")
+    agent_executable = tmp_path / "selected-claude"
+    agent_executable.write_bytes(b"fixture-agent\n")
+    bwrap = tmp_path / "bwrap"
+    bwrap.write_bytes(b"fixture-bwrap\n")
+    staged: list[tuple[Path, bytes, int, list[str]]] = []
+
+    def build_real_argv(policy, command, environment):
+        argv = native_sandbox.build_bwrap_argv(policy, command, environment)
+        client_mount = next(
+            Path(argv[index + 1])
+            for index, value in enumerate(argv)
+            if value == "--ro-bind" and argv[index + 2] == "/opt/aisle/attempt-client"
+        )
+        staged.append(
+            (
+                client_mount,
+                client_mount.read_bytes(),
+                stat.S_IMODE(client_mount.stat().st_mode),
+                argv,
+            )
+        )
+        return argv
+
+    def execute_agent(
+        command,
+        cwd,
+        agent,
+        on_line,
+        stop_reason,
+        wall_ceiling_s,
+        environment,
+    ):
+        on_line(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 3,
+                            "cache_creation_input_tokens": 2,
+                            "output_tokens": 1,
+                        }
+                    },
+                }
+            )
+            + "\n",
+            0.25,
+        )
+        return controller.ExecutionResult(
+            stopped="agent_done",
+            returncode=0,
+            wall_s=0.25,
+            agent_version="fixture-agent",
+            sandbox_identity=_fixture_sandbox_identity(),
+            process_group_clean=True,
+        )
+
+    runtime = replace(
+        _controller_runtime(controller),
+        worktrees_root=native_sandbox_worktrees_root,
+        execute_agent=execute_agent,
+        agent_environment=lambda agent: agent_env,
+        inspect_agent_environment=lambda path: environment_builder.AgentEnvironmentSpec(
+            python=str(python),
+            lock_sha256="a" * 64,
+            distributions=("pytest==9.0.0",),
+            executables=("python",),
+        ),
+        agent_executable=lambda agent: agent_executable,
+        bwrap_executable=lambda: bwrap,
+        build_bwrap_argv=build_real_argv,
+        execute_sandbox_probe=lambda command, cwd, environment, timeout: (
+            _valid_native_sandbox_probe()
+        ),
+    )
+    campaign, result, runtime = _prepare_controller_campaign(
+        controller,
+        tmp_path / "controller",
+        runtime=runtime,
+    )
+    session_dir = campaign / result["sessions"][0]
+
+    returncode, response, _, _ = _run_prepared_controller_session(
+        controller,
+        session_dir,
+        runtime,
+    )
+
+    assert returncode == 0 and response["ok"] is True, response
+    assert len(staged) == 2
+    for client_mount, client_bytes, client_mode, argv in staged:
+        assert client_mount != controller.ATTEMPT_CLIENT
+        assert client_mount.name == "attempt-client"
+        assert client_bytes == controller.ATTEMPT_CLIENT.read_bytes()
+        assert client_mode == 0o400
+        assert str(controller.ATTEMPT_CLIENT) not in argv
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["builder", "probe", "client_hash", "executor", "state_write"],
+)
+def test_sandbox_startup_exceptions_revoke_broker_and_record_terminal_infrastructure(
+    tmp_path: Path,
+    monkeypatch,
+    failure_stage: str,
+):
+    """Native isolation design: every post-start exception closes all broker resources."""
+    from tools import s1_harness_ablation as controller
+
+    runtime_dir = tmp_path / "private-runtime"
+    brokers = []
+    broker_class = controller.AttemptBroker
+
+    def broker_factory(*args, **kwargs):
+        broker = broker_class(*args, runtime_dir=runtime_dir, **kwargs)
+        brokers.append(broker)
+        return broker
+
+    monkeypatch.setattr(controller, "AttemptBroker", broker_factory)
+    runtime = _controller_runtime(controller)
+    if failure_stage == "builder":
+        runtime = replace(
+            runtime,
+            build_bwrap_argv=lambda policy, command, environment: (_ for _ in ()).throw(
+                ValueError("fixture builder failure")
+            ),
+        )
+    elif failure_stage == "probe":
+        runtime = replace(
+            runtime,
+            execute_sandbox_probe=lambda command, cwd, environment, timeout: (_ for _ in ()).throw(
+                controller.ControllerError("SANDBOX_PROBE", "fixture probe failure")
+            ),
+        )
+    elif failure_stage == "client_hash":
+        real_sha256_file = controller.sha256_file
+
+        def fail_staged_hash(path: Path) -> str:
+            if Path(path).name == "attempt-client":
+                raise OSError("fixture staged hash failure")
+            return real_sha256_file(path)
+
+        monkeypatch.setattr(controller, "sha256_file", fail_staged_hash)
+    elif failure_stage == "executor":
+        runtime = replace(
+            runtime,
+            execute_agent=lambda *args, **kwargs: (_ for _ in ()).throw(
+                controller.ControllerError("AGENT_LAUNCH", "fixture executor failure")
+            ),
+        )
+
+    campaign, result, runtime = _prepare_controller_campaign(
+        controller,
+        tmp_path / "controller",
+        runtime=runtime,
+    )
+    session_dir = campaign / result["sessions"][0]
+    if failure_stage == "state_write":
+        real_write_json = controller._write_json
+        failed = False
+
+        def fail_first_running_write(path: Path, value: object) -> None:
+            nonlocal failed
+            if (
+                not failed
+                and Path(path) == session_dir / "session.json"
+                and isinstance(value, dict)
+                and value.get("state") == "running"
+            ):
+                failed = True
+                raise OSError("fixture state write failure")
+            real_write_json(path, value)
+
+        monkeypatch.setattr(controller, "_write_json", fail_first_running_write)
+
+    try:
+        returncode, response, _, _ = _run_prepared_controller_session(
+            controller,
+            session_dir,
+            runtime,
+        )
+
+        assert returncode == 1
+        assert response["ok"] is False
+        assert not runtime_dir.exists()
+        assert brokers and all(
+            broker._thread is None or not broker._thread.is_alive() for broker in brokers
+        )
+        session = json.loads((session_dir / "session.json").read_text())
+        assert session["state"] == "agent_stopped"
+        assert session["stop_reason"] == "infrastructure"
+    finally:
+        for broker in brokers:
+            broker.stop()
+        if runtime_dir.exists():
+            runtime_dir.rmdir()
 
 
 def _fixture_agent_environment(destination: Path) -> Path:

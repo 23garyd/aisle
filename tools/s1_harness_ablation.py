@@ -99,6 +99,8 @@ GLOBAL_SIMULATOR_LOCK = Path("/tmp/aisle-s1-harness-ablation-simulator.lock")
 _ATTEMPT_PROTOCOL = 1
 _MAX_BROKER_MESSAGE_BYTES = 1024 * 1024
 _PROBE_TIMEOUT_S = 30.0
+_SOURCE_EXCLUDED_TOP_LEVEL = frozenset({".git", ".venv", "runs"})
+_SOURCE_EXCLUDED_NAMES = frozenset({"attempt.sock", "credential.json", "__pycache__"})
 
 _GOAL = (
     "Improve the supplied incomplete S1 store-order-pick starter so the robot "
@@ -145,7 +147,8 @@ class ExecutionResult:
     returncode: int
     wall_s: float
     agent_version: str
-    process_group_clean: bool = True
+    sandbox_identity: dict | None = None
+    process_group_clean: bool | None = None
 
 
 def _resolve_pin(repo: Path, pin: str) -> str:
@@ -259,6 +262,253 @@ def _default_execute_sandbox_probe(
     return result
 
 
+def _read_proc_stat(path: Path) -> dict[str, int]:
+    text = path.read_text(encoding="utf-8")
+    closing = text.rfind(")")
+    if closing <= 0:
+        raise ValueError("malformed proc stat")
+    pid = int(text[: text.find(" ")])
+    fields = text[closing + 1 :].split()
+    if len(fields) < 20:
+        raise ValueError("short proc stat")
+    return {
+        "pid": pid,
+        "ppid": int(fields[1]),
+        "process_group_id": int(fields[2]),
+        "starttime_ticks": int(fields[19]),
+    }
+
+
+def _pid_namespace_inode(proc_root: Path, pid: int, task_id: int | None = None) -> int:
+    base = proc_root / str(pid)
+    if task_id is not None:
+        base = base / "task" / str(task_id)
+    return base.joinpath("ns", "pid").stat().st_ino
+
+
+def _capture_process_group_identity(
+    pid: int,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, int | str]:
+    values = _read_proc_stat(proc_root / str(pid) / "stat")
+    return {
+        "kind": "process_group",
+        "leader_pid": pid,
+        "leader_starttime_ticks": values["starttime_ticks"],
+        "process_group_id": values["process_group_id"],
+        "pid_namespace_inode": _pid_namespace_inode(proc_root, pid),
+    }
+
+
+def _capture_thread_identity(
+    thread: threading.Thread,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, int | str]:
+    if thread.native_id is None:
+        raise ControllerError("BROKER_IDENTITY", "broker thread has no native identity")
+    pid = os.getpid()
+    task_id = thread.native_id
+    values = _read_proc_stat(proc_root / str(pid) / "task" / str(task_id) / "stat")
+    return {
+        "kind": "thread",
+        "process_id": pid,
+        "task_id": task_id,
+        "starttime_ticks": values["starttime_ticks"],
+        "pid_namespace_inode": _pid_namespace_inode(proc_root, pid, task_id),
+    }
+
+
+def _inspect_owned_identity(
+    identity: dict,
+    *,
+    proc_root: Path = Path("/proc"),
+    checked_at_epoch: float | None = None,
+) -> dict:
+    """Independently inspect whether one exact process-group or thread identity survives."""
+
+    checked = time.time() if checked_at_epoch is None else float(checked_at_epoch)
+    core: dict[str, Any] = {
+        "identity": identity,
+        "checked_at_epoch": checked,
+        "status": "unverifiable",
+        "observed": [],
+    }
+    try:
+        if not isinstance(identity, dict):
+            raise ValueError("identity is not an object")
+        if identity.get("kind") == "process_group":
+            group_id = identity["process_group_id"]
+            namespace_inode = identity["pid_namespace_inode"]
+            leader_pid = identity["leader_pid"]
+            leader_starttime = identity["leader_starttime_ticks"]
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in (group_id, namespace_inode, leader_pid, leader_starttime)
+            ):
+                raise ValueError("process group identity is invalid")
+            observed: list[dict[str, int]] = []
+            for stat_path in sorted(proc_root.glob("[0-9]*/stat")):
+                try:
+                    values = _read_proc_stat(stat_path)
+                    if values["process_group_id"] != group_id:
+                        continue
+                    observed.append(
+                        {
+                            "pid": values["pid"],
+                            "starttime_ticks": values["starttime_ticks"],
+                            "pid_namespace_inode": _pid_namespace_inode(
+                                proc_root,
+                                values["pid"],
+                            ),
+                        }
+                    )
+                except (OSError, ValueError):
+                    continue
+            core["observed"] = observed
+            if observed:
+                core["status"] = "surviving"
+            else:
+                leader_path = proc_root / str(leader_pid) / "stat"
+                try:
+                    current = _read_proc_stat(leader_path)
+                    current_namespace = _pid_namespace_inode(proc_root, leader_pid)
+                except FileNotFoundError:
+                    core["status"] = "absent"
+                else:
+                    core["status"] = (
+                        "surviving"
+                        if current["starttime_ticks"] == leader_starttime
+                        and current_namespace == namespace_inode
+                        else "pid_reused"
+                    )
+        elif identity.get("kind") == "thread":
+            pid = identity["process_id"]
+            task_id = identity["task_id"]
+            starttime = identity["starttime_ticks"]
+            namespace_inode = identity["pid_namespace_inode"]
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in (pid, task_id, starttime, namespace_inode)
+            ):
+                raise ValueError("thread identity is invalid")
+            task = proc_root / str(pid) / "task" / str(task_id)
+            try:
+                current = _read_proc_stat(task / "stat")
+                current_namespace = _pid_namespace_inode(proc_root, pid, task_id)
+            except FileNotFoundError:
+                core["status"] = "absent"
+            else:
+                if current["starttime_ticks"] == starttime and current_namespace == namespace_inode:
+                    core["status"] = "surviving"
+                    core["observed"] = [
+                        {
+                            "pid": pid,
+                            "task_id": task_id,
+                            "starttime_ticks": starttime,
+                            "pid_namespace_inode": namespace_inode,
+                        }
+                    ]
+                else:
+                    core["status"] = "pid_reused"
+        else:
+            raise ValueError("unknown identity kind")
+    except (KeyError, OSError, TypeError, ValueError):
+        core["status"] = "unverifiable"
+        core["observed"] = []
+    core["evidence_sha256"] = _sha256_text(_canonical_json(core))
+    return core
+
+
+def _filesystem_identity(path: Path, kind: str, sha256: str | None = None) -> dict:
+    info = path.lstat()
+    identity = {
+        "kind": kind,
+        "path": str(path),
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "ctime_ns": info.st_ctime_ns,
+    }
+    if sha256 is not None:
+        identity["sha256"] = sha256
+    return identity
+
+
+def _inspect_filesystem_identity(
+    identity: dict,
+    *,
+    checked_at_epoch: float | None = None,
+) -> dict:
+    checked = time.time() if checked_at_epoch is None else float(checked_at_epoch)
+    core: dict[str, Any] = {
+        "identity": identity,
+        "checked_at_epoch": checked,
+        "status": "unverifiable",
+    }
+    try:
+        path = Path(identity["path"])
+        info = path.lstat()
+    except FileNotFoundError:
+        core["status"] = "absent"
+    except (KeyError, OSError, TypeError, ValueError):
+        core["status"] = "unverifiable"
+    else:
+        current = (info.st_dev, info.st_ino, info.st_ctime_ns)
+        expected = (identity["device"], identity["inode"], identity["ctime_ns"])
+        core["status"] = "surviving" if current == expected else "replaced"
+    core["evidence_sha256"] = _sha256_text(_canonical_json(core))
+    return core
+
+
+def _descendant_process_group_identities(
+    parent_pid: int | None = None,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> tuple[dict, ...]:
+    parent_pid = os.getpid() if parent_pid is None else parent_pid
+    processes: dict[int, dict[str, int]] = {}
+    for stat_path in proc_root.glob("[0-9]*/stat"):
+        try:
+            values = _read_proc_stat(stat_path)
+        except (OSError, ValueError):
+            continue
+        processes[values["pid"]] = values
+    descendants = {parent_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, values in processes.items():
+            if values["ppid"] in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    descendants.discard(parent_pid)
+    identities: dict[int, dict] = {}
+    for pid in sorted(descendants):
+        values = processes[pid]
+        group_id = values["process_group_id"]
+        if group_id in identities or group_id not in descendants:
+            continue
+        try:
+            identities[group_id] = _capture_process_group_identity(
+                group_id,
+                proc_root=proc_root,
+            )
+        except (OSError, ValueError):
+            continue
+    return tuple(identities[group_id] for group_id in sorted(identities))
+
+
+def _terminate_owned_identity(identity: dict) -> None:
+    evidence = _inspect_owned_identity(identity)
+    if evidence.get("status") != "surviving" or identity.get("kind") != "process_group":
+        return
+    try:
+        os.killpg(int(identity["process_group_id"]), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 @dataclass(frozen=True)
 class ControllerRuntime:
     """Narrow external boundaries; tests replace them with zero-cost fixtures."""
@@ -283,6 +533,11 @@ class ControllerRuntime:
     execute_sandbox_probe: Callable[[list[str], Path, dict[str, str], float], dict] = (
         _default_execute_sandbox_probe
     )
+    inspect_owned_identity: Callable[[dict], dict] = lambda identity: _inspect_owned_identity(
+        identity
+    )
+    descendant_identities: Callable[[], tuple[dict, ...]] = _descendant_process_group_identities
+    terminate_owned_identity: Callable[[dict], None] = _terminate_owned_identity
 
 
 @dataclass(frozen=True)
@@ -299,6 +554,9 @@ class BrokerEndpoint:
     credential_sha256: str
     started_at_epoch: float
     expires_at_epoch: float
+    runtime_identity: dict
+    socket_identity: dict
+    credential_identity: dict
 
 
 @dataclass(frozen=True)
@@ -314,6 +572,303 @@ class AuthorizedAttempt:
     seeds: tuple[int, ...]
     seed_domain: str
     request_sha256: str
+
+
+@dataclass(frozen=True)
+class CandidateCapture:
+    """Exact bytes and stable file identity captured through one no-follow descriptor."""
+
+    bytes_value: bytes
+    sha256: str
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+    def evidence(self) -> dict[str, int | str]:
+        return {
+            "sha256": self.sha256,
+            "device": self.device,
+            "inode": self.inode,
+            "size": self.size,
+            "mtime_ns": self.mtime_ns,
+            "ctime_ns": self.ctime_ns,
+        }
+
+
+@dataclass(frozen=True)
+class AttemptSnapshot:
+    """Controller-owned immutable source plus its dedicated writable run root."""
+
+    root: Path
+    candidate: Path
+    tree_sha256: str
+    trusted_template_sha256: str
+
+
+def _stable_file_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _capture_candidate_fd(worktree: Path, relative: str) -> CandidateCapture:
+    """Open a contained candidate once and bind all copied bytes to that descriptor."""
+
+    boundary = worktree.expanduser().resolve(strict=True)
+    requested = Path(relative)
+    if (
+        requested.is_absolute()
+        or not requested.parts
+        or any(part in {"", ".", ".."} for part in requested.parts)
+    ):
+        raise ControllerError("CANDIDATE_PATH", "candidate path is not a safe relative path")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
+    descriptors: list[int] = []
+    try:
+        current = os.open(boundary, directory_flags)
+        descriptors.append(current)
+        for part in requested.parts[:-1]:
+            current = os.open(part, directory_flags, dir_fd=current)
+            descriptors.append(current)
+        candidate_fd = os.open(
+            requested.parts[-1],
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=current,
+        )
+        descriptors.append(candidate_fd)
+        before = os.fstat(candidate_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ControllerError("CANDIDATE_PATH", "candidate must be a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(candidate_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(candidate_fd)
+        value = b"".join(chunks)
+        if (
+            _stable_file_identity(before) != _stable_file_identity(after)
+            or len(value) != before.st_size
+        ):
+            raise ControllerError("CANDIDATE_HASH", "candidate changed during capture")
+        return CandidateCapture(
+            bytes_value=value,
+            sha256=hashlib.sha256(value).hexdigest(),
+            device=before.st_dev,
+            inode=before.st_ino,
+            size=before.st_size,
+            mtime_ns=before.st_mtime_ns,
+            ctime_ns=before.st_ctime_ns,
+        )
+    except ControllerError:
+        raise
+    except OSError as exc:
+        raise ControllerError("CANDIDATE_PATH", "candidate could not be captured safely") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _copy_source_tree(source: Path, destination: Path) -> None:
+    """Copy regular trusted source without following links or copying runtime material."""
+
+    source = source.resolve(strict=True)
+    destination.mkdir(mode=0o700, parents=False, exist_ok=False)
+
+    def copy_directory(source_dir: Path, destination_dir: Path, relative: Path) -> None:
+        for entry in sorted(os.scandir(source_dir), key=lambda item: item.name):
+            child_relative = relative / entry.name
+            if (
+                not relative.parts and entry.name in _SOURCE_EXCLUDED_TOP_LEVEL
+            ) or entry.name in _SOURCE_EXCLUDED_NAMES:
+                continue
+            info = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise ControllerError(
+                    "SOURCE_SNAPSHOT", f"trusted source contains symlink: {child_relative}"
+                )
+            target = destination_dir / entry.name
+            if stat.S_ISDIR(info.st_mode):
+                target.mkdir(mode=0o700)
+                copy_directory(Path(entry.path), target, child_relative)
+            elif stat.S_ISREG(info.st_mode):
+                source_fd = os.open(entry.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    target_fd = os.open(
+                        target,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                    )
+                    try:
+                        while True:
+                            chunk = os.read(source_fd, 1024 * 1024)
+                            if not chunk:
+                                break
+                            offset = 0
+                            while offset < len(chunk):
+                                written = os.write(target_fd, chunk[offset:])
+                                if written <= 0:
+                                    raise OSError("short trusted-source write")
+                                offset += written
+                        os.fsync(target_fd)
+                    finally:
+                        os.close(target_fd)
+                finally:
+                    os.close(source_fd)
+            elif stat.S_ISSOCK(info.st_mode):
+                continue
+            else:
+                raise ControllerError(
+                    "SOURCE_SNAPSHOT",
+                    f"trusted source contains unsupported entry: {child_relative}",
+                )
+
+    try:
+        copy_directory(source, destination, Path())
+    except Exception:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+
+
+def _source_tree_manifest(root: Path) -> tuple[list[dict[str, int | str]], str]:
+    entries: list[dict[str, int | str]] = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if relative.parts[0] == "runs" or relative.as_posix() == "controller_snapshot.json":
+            continue
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ControllerError("SOURCE_SNAPSHOT", "snapshot contains a symlink")
+        if stat.S_ISDIR(info.st_mode):
+            entries.append(
+                {
+                    "path": relative.as_posix(),
+                    "kind": "directory",
+                    "mode": stat.S_IMODE(info.st_mode),
+                }
+            )
+        elif stat.S_ISREG(info.st_mode):
+            entries.append(
+                {
+                    "path": relative.as_posix(),
+                    "kind": "file",
+                    "mode": stat.S_IMODE(info.st_mode),
+                    "size": info.st_size,
+                    "sha256": sha256_file(path),
+                }
+            )
+        else:
+            raise ControllerError("SOURCE_SNAPSHOT", "snapshot entry type is unsupported")
+    return entries, _sha256_text(_canonical_json(entries))
+
+
+def _make_tree_readonly(root: Path, *, keep_runs_writable: bool) -> None:
+    for path in sorted(root.rglob("*"), reverse=True):
+        relative = path.relative_to(root)
+        if keep_runs_writable and relative.parts[0] == "runs":
+            continue
+        info = path.lstat()
+        if stat.S_ISREG(info.st_mode):
+            os.chmod(path, 0o400, follow_symlinks=False)
+        elif stat.S_ISDIR(info.st_mode):
+            os.chmod(path, 0o500, follow_symlinks=False)
+    os.chmod(root, 0o500, follow_symlinks=False)
+
+
+def _prepare_trusted_template(session_dir: Path, worktree: Path) -> tuple[str, str]:
+    template = session_dir / "trusted-source"
+    _copy_source_tree(worktree, template)
+    _make_tree_readonly(template, keep_runs_writable=False)
+    entries, tree_sha256 = _source_tree_manifest(template)
+    _write_json(
+        session_dir / "trusted-source-manifest.json",
+        {"schema_version": 1, "tree_sha256": tree_sha256, "entries": entries},
+    )
+    return template.name, tree_sha256
+
+
+def _create_attempt_snapshot(
+    session_dir: Path,
+    record: dict,
+    attempt_id: str,
+    capture: CandidateCapture,
+) -> AttemptSnapshot:
+    template = (session_dir / str(record.get("trusted_template", ""))).resolve(strict=True)
+    _, trusted_sha256 = _source_tree_manifest(template)
+    if trusted_sha256 != record.get("trusted_template_sha256"):
+        raise ControllerError("SOURCE_SNAPSHOT", "trusted source template changed")
+    snapshots = session_dir / "attempt-snapshots"
+    snapshots.mkdir(mode=0o700, exist_ok=True)
+    root = snapshots / attempt_id
+    _copy_source_tree(template, root)
+    relative = (
+        Path(str(record["candidate"]))
+        .resolve()
+        .relative_to(Path(str(record["worktree"])).resolve())
+    )
+    candidate = root / relative
+    if not candidate.is_file():
+        raise ControllerError("SOURCE_SNAPSHOT", "template candidate is unavailable")
+    parent = candidate.parent
+    while True:
+        os.chmod(parent, 0o700, follow_symlinks=False)
+        if parent == root:
+            break
+        parent = parent.parent
+    os.chmod(candidate, 0o600, follow_symlinks=False)
+    descriptor = os.open(
+        candidate,
+        os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        offset = 0
+        while offset < len(capture.bytes_value):
+            written = os.write(descriptor, capture.bytes_value[offset:])
+            if written <= 0:
+                raise OSError("short candidate snapshot write")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.chmod(candidate, 0o400, follow_symlinks=False)
+    runs = root / "runs"
+    runs.mkdir(mode=0o700)
+    _make_tree_readonly(root, keep_runs_writable=True)
+    entries, tree_sha256 = _source_tree_manifest(root)
+    if sha256_file(candidate) != capture.sha256:
+        raise ControllerError("SOURCE_SNAPSHOT", "snapshot candidate attribution failed")
+    os.chmod(root, 0o700, follow_symlinks=False)
+    _write_json(
+        root / "controller_snapshot.json",
+        {
+            "schema_version": 1,
+            "trusted_template_sha256": trusted_sha256,
+            "tree_sha256": tree_sha256,
+            "candidate_sha256": capture.sha256,
+            "candidate_capture": capture.evidence(),
+            "entries": entries,
+        },
+    )
+    os.chmod(root / "controller_snapshot.json", 0o400, follow_symlinks=False)
+    os.chmod(root, 0o500, follow_symlinks=False)
+    return AttemptSnapshot(
+        root=root,
+        candidate=candidate,
+        tree_sha256=tree_sha256,
+        trusted_template_sha256=trusted_sha256,
+    )
 
 
 def _private_runtime_directory(path: Path, worktree: Path) -> Path:
@@ -427,7 +982,10 @@ class AttemptBroker:
         self._server: socket.socket | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._thread_identity: dict | None = None
         self._fatal_reason: str | None = None
+        self._staged_files: set[Path] = set()
+        self._staged_identities: list[dict] = []
 
     @property
     def endpoint(self) -> BrokerEndpoint:
@@ -442,6 +1000,14 @@ class AttemptBroker:
     @property
     def credential_sha256(self) -> str:
         return self.endpoint.credential_sha256
+
+    @property
+    def thread_identity(self) -> dict | None:
+        return self._thread_identity
+
+    @property
+    def staged_identities(self) -> tuple[dict, ...]:
+        return tuple(self._staged_identities)
 
     def environment(self) -> dict[str, str]:
         """No host path or credential is inherited by the sandboxed process."""
@@ -509,6 +1075,13 @@ class AttemptBroker:
             }
             _write_json(credential_path, config)
             os.chmod(credential_path, 0o600)
+            runtime_identity = _filesystem_identity(runtime_dir, "directory")
+            socket_file_identity = _filesystem_identity(socket_path, "socket")
+            credential_identity = _filesystem_identity(
+                credential_path,
+                "file",
+                sha256_file(credential_path),
+            )
             server.listen(1)
             server.settimeout(0.1)
         except Exception:
@@ -529,6 +1102,9 @@ class AttemptBroker:
             credential_sha256=_sha256_text(credential),
             started_at_epoch=self.started_at_epoch,
             expires_at_epoch=self.expires_at_epoch,
+            runtime_identity=runtime_identity,
+            socket_identity=socket_file_identity,
+            credential_identity=credential_identity,
         )
         self._thread = threading.Thread(
             target=self._serve,
@@ -536,11 +1112,62 @@ class AttemptBroker:
             daemon=True,
         )
         self._thread.start()
+        self._thread_identity = _capture_thread_identity(self._thread)
         return self._endpoint
 
     def __enter__(self) -> AttemptBroker:
         self.start()
         return self
+
+    def stage_client(self, source: Path) -> Path:
+        """Copy the immutable client into this private runtime and verify exact bytes."""
+
+        endpoint = self.endpoint
+        source = source.expanduser().resolve(strict=True)
+        staged = endpoint.runtime_dir / "attempt-client"
+        if staged.exists() or staged.is_symlink():
+            raise ControllerError("ATTEMPT_CLIENT_STAGE", "staged client path is not fresh")
+        try:
+            source_bytes = source.read_bytes()
+            source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+            descriptor = os.open(
+                staged,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o400,
+            )
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                stream.write(source_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(staged, 0o400, follow_symlinks=False)
+            staged_info = staged.lstat()
+            if (
+                not stat.S_ISREG(staged_info.st_mode)
+                or staged_info.st_uid != os.getuid()
+                or stat.S_IMODE(staged_info.st_mode) != 0o400
+                or sha256_file(staged) != source_sha256
+                or sha256_file(source) != source_sha256
+            ):
+                raise ControllerError(
+                    "ATTEMPT_CLIENT_STAGE",
+                    "staged client does not match its trusted source",
+                )
+            directory = os.open(endpoint.runtime_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except ControllerError:
+            staged.unlink(missing_ok=True)
+            raise
+        except OSError as exc:
+            staged.unlink(missing_ok=True)
+            raise ControllerError(
+                "ATTEMPT_CLIENT_STAGE", "immutable attempt client could not be staged"
+            ) from exc
+        self._staged_files.add(staged)
+        self._staged_identities.append(_filesystem_identity(staged, "file", source_sha256))
+        return staged
 
     def _socket_identity_valid(self) -> bool:
         try:
@@ -738,9 +1365,18 @@ class AttemptBroker:
         if self._thread is not None:
             self._thread.join(timeout=5)
         clean = self._thread is None or not self._thread.is_alive()
+        for staged in self._staged_files:
+            staged.unlink(missing_ok=True)
+        self._staged_files.clear()
         if self._endpoint is not None:
             self._endpoint.socket_path.unlink(missing_ok=True)
             self._endpoint.credential_path.unlink(missing_ok=True)
+        try:
+            self.runtime_dir.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            clean = False
         self._credential = None
         self.__root_capability = b""
         return clean
@@ -914,11 +1550,10 @@ def _prepare(args: argparse.Namespace, runtime: ControllerRuntime, repo_root: Pa
         raise ControllerError("WORKTREE_ROOT", "configured session worktree root is invalid")
 
     for index, condition in enumerate(assignments, start=1):
-        session_id = f"S{index:04d}"
+        session_id = f"S{index:04d}-{_sha256_text(f'{out}:{index}')[:24]}"
         sessions.append(session_id)
         session_dir = out / session_id
-        worktree_tag = _sha256_text(f"{out}:{session_id}")[:16]
-        worktree = configured_root / f"s1-{worktree_tag}-{session_id}"
+        worktree = configured_root / session_id
         session_dir.mkdir()
         if worktree.exists():
             raise ControllerError("WORKTREE_CREATE", f"session worktree already exists: {worktree}")
@@ -937,6 +1572,10 @@ def _prepare(args: argparse.Namespace, runtime: ControllerRuntime, repo_root: Pa
         candidate_path = worktree / candidate
         candidate_path.parent.mkdir(parents=True, exist_ok=True)
         candidate_path.write_bytes(starter_path.read_bytes())
+        trusted_template, trusted_template_sha256 = _prepare_trusted_template(
+            session_dir,
+            worktree,
+        )
 
         record: dict[str, Any] = {
             "schema_version": 1,
@@ -953,6 +1592,8 @@ def _prepare(args: argparse.Namespace, runtime: ControllerRuntime, repo_root: Pa
             "worktree_path_sha256": _sha256_text(str(worktree)),
             "starter": starter.as_posix(),
             "candidate": str(candidate_path.resolve()),
+            "trusted_template": trusted_template,
+            "trusted_template_sha256": trusted_template_sha256,
             "budget_ceiling": {
                 "tokens": MAX_NEW_TOKENS,
                 "episodes": MAX_DEVELOPMENT_EPISODES,
@@ -1138,6 +1779,15 @@ def _execute_agent(
         )
     except OSError as exc:
         raise ControllerError("AGENT_LAUNCH", str(exc)) from exc
+    try:
+        sandbox_identity = _capture_process_group_identity(process.pid)
+    except (OSError, ValueError) as exc:
+        _kill_process_group(process)
+        process.wait(timeout=30)
+        raise ControllerError(
+            "AGENT_IDENTITY",
+            "sandbox process group identity could not be captured",
+        ) from exc
     assert process.stdout is not None
     events: queue.Queue[str | None] = queue.Queue()
 
@@ -1186,6 +1836,8 @@ def _execute_agent(
         stopped = "wall_budget"
         _kill_process_group(process)
         returncode = process.wait(timeout=30)
+    if stopped == "agent_done":
+        _kill_process_group(process)
     reader.join(timeout=10)
     process.stdout.close()
     return ExecutionResult(
@@ -1193,6 +1845,7 @@ def _execute_agent(
         returncode=returncode,
         wall_s=round(time.monotonic() - started, 3),
         agent_version=_agent_version(agent),
+        sandbox_identity=sandbox_identity,
     )
 
 
@@ -1303,6 +1956,138 @@ def _trusted_run_components(
     return hashes, agent_env, agent_executable, bwrap
 
 
+def _not_started_evidence(checked_at_epoch: float) -> dict:
+    core = {
+        "identity": None,
+        "checked_at_epoch": checked_at_epoch,
+        "status": "not_started",
+        "observed": [],
+    }
+    core["evidence_sha256"] = _sha256_text(_canonical_json(core))
+    return core
+
+
+def _isolation_cleanup_evidence(
+    runtime: ControllerRuntime,
+    broker: AttemptBroker,
+    endpoint: BrokerEndpoint | None,
+    execution: ExecutionResult | None,
+) -> dict:
+    checked_at_epoch = float(runtime.epoch_time())
+    sandbox = (
+        _not_started_evidence(checked_at_epoch)
+        if execution is None
+        else runtime.inspect_owned_identity(execution.sandbox_identity)
+        if isinstance(execution.sandbox_identity, dict)
+        else {
+            **_not_started_evidence(checked_at_epoch),
+            "status": "unverifiable",
+        }
+    )
+    if sandbox.get("status") == "unverifiable":
+        sandbox = dict(sandbox)
+        sandbox.pop("evidence_sha256", None)
+        sandbox["evidence_sha256"] = _sha256_text(_canonical_json(sandbox))
+    broker_thread = (
+        runtime.inspect_owned_identity(broker.thread_identity)
+        if isinstance(broker.thread_identity, dict)
+        else _not_started_evidence(checked_at_epoch)
+    )
+    filesystem_identities: list[dict] = []
+    if endpoint is not None:
+        filesystem_identities.extend(
+            (
+                endpoint.runtime_identity,
+                endpoint.socket_identity,
+                endpoint.credential_identity,
+            )
+        )
+    filesystem_identities.extend(broker.staged_identities)
+    filesystem = [
+        _inspect_filesystem_identity(
+            identity,
+            checked_at_epoch=checked_at_epoch,
+        )
+        for identity in filesystem_identities
+    ]
+    core = {
+        "schema_version": 1,
+        "checked_at_epoch": checked_at_epoch,
+        "sandbox": sandbox,
+        "broker_thread": broker_thread,
+        "filesystem": filesystem,
+    }
+    core["evidence_sha256"] = _sha256_text(_canonical_json(core))
+    return core
+
+
+def _evidence_hash_valid(evidence: object) -> bool:
+    if not isinstance(evidence, dict) or not isinstance(evidence.get("evidence_sha256"), str):
+        return False
+    unsigned = dict(evidence)
+    expected = unsigned.pop("evidence_sha256")
+    return hmac.compare_digest(expected, _sha256_text(_canonical_json(unsigned)))
+
+
+def _cleanup_evidence_valid(cleanup: object, runtime: ControllerRuntime) -> bool:
+    if (
+        not isinstance(cleanup, dict)
+        or set(cleanup)
+        != {
+            "schema_version",
+            "checked_at_epoch",
+            "sandbox",
+            "broker_thread",
+            "filesystem",
+            "evidence_sha256",
+        }
+        or cleanup.get("schema_version") != 1
+        or not _evidence_hash_valid(cleanup)
+    ):
+        return False
+    checked = cleanup.get("checked_at_epoch")
+    if (
+        isinstance(checked, bool)
+        or not isinstance(checked, (int, float))
+        or not math.isfinite(float(checked))
+    ):
+        return False
+    sandbox = cleanup.get("sandbox")
+    broker_thread = cleanup.get("broker_thread")
+    filesystem = cleanup.get("filesystem")
+    if (
+        not _evidence_hash_valid(sandbox)
+        or not _evidence_hash_valid(broker_thread)
+        or not isinstance(filesystem, list)
+        or not all(_evidence_hash_valid(item) for item in filesystem)
+    ):
+        return False
+    allowed_owned = {"absent", "pid_reused", "not_started"}
+    if (
+        sandbox.get("status") not in allowed_owned
+        or broker_thread.get("status") not in allowed_owned
+        or any(item.get("status") not in {"absent", "replaced"} for item in filesystem)
+    ):
+        return False
+    for evidence in (sandbox, broker_thread):
+        identity = evidence.get("identity")
+        if identity is None:
+            if evidence.get("status") != "not_started":
+                return False
+            continue
+        current = runtime.inspect_owned_identity(identity)
+        if not _evidence_hash_valid(current) or current.get("status") not in {
+            "absent",
+            "pid_reused",
+        }:
+            return False
+    for evidence in filesystem:
+        current = _inspect_filesystem_identity(evidence.get("identity", {}))
+        if not _evidence_hash_valid(current) or current.get("status") not in {"absent", "replaced"}:
+            return False
+    return True
+
+
 def _run(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
     session_dir = _session_dir(args.session)
     record = _load_json(session_dir / "session.json")
@@ -1389,67 +2174,72 @@ def _run(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
         controller_hashes=component_hashes,
         expires_at_epoch=started_at_epoch + args.wall_h * 3600.0,
     )
-    endpoint = attempt_broker.start()
-    policy = SandboxPolicy(
-        worktree=worktree,
-        agent_env=agent_env,
-        runtime_dir=endpoint.runtime_dir,
-        attempt_client=ATTEMPT_CLIENT,
-        agent_executable=agent_executable,
-        credential_mounts=(),
-    )
-    probe_argv = runtime.build_bwrap_argv(policy, runtime.sandbox_probe_command(), {})
-    probe_result = runtime.execute_sandbox_probe(
-        probe_argv,
-        worktree,
-        os.environ.copy(),
-        _PROBE_TIMEOUT_S,
-    )
-    probe_ok, probe_errors = native_sandbox.verify_sandbox_probe(probe_result)
-    if not probe_ok:
-        attempt_broker.stop()
-        raise ControllerError(
-            "SANDBOX_PROBE",
-            f"sandbox probe did not match the required contract: {list(probe_errors)}",
-        )
-    vendor_command = agent_cmd_campaign(args.agent, args.model, prompt)
-    vendor_command[0] = "/opt/aisle/agent"
-    command = runtime.build_bwrap_argv(policy, vendor_command, os.environ.copy())
-    isolation = {
-        **component_hashes,
-        "broker_id": endpoint.broker_id,
-        "credential_sha256": endpoint.credential_sha256,
-        "socket_inode": endpoint.socket_inode,
-        "socket_ctime_ns": endpoint.socket_ctime_ns,
-        "socket_identity_sha256": endpoint.socket_identity_sha256,
-        "broker_started_at_epoch": endpoint.started_at_epoch,
-        "credential_expires_at_epoch": endpoint.expires_at_epoch,
-        "namespace_probe": probe_result,
-        "namespace_probe_sha256": _sha256_text(_canonical_json(probe_result)),
-        "probe_argv_sha256": _sha256_text(_canonical_json(probe_argv)),
-        "sandbox_argv_sha256": _sha256_text(_canonical_json(command)),
-    }
-    record.update(
-        {
-            "state": "running",
-            "agent": args.agent,
-            "model": args.model,
-            "budgets": budgets,
-            "run_prompt_sha256": _sha256_text(prompt),
-            "started_at_epoch": started_at_epoch,
-            "episode_reservation_sha256": reservation_hash,
-            "attempt_broker": {
-                "credential_sha256": endpoint.credential_sha256,
-                "broker_id": endpoint.broker_id,
-                "socket_identity_sha256": endpoint.socket_identity_sha256,
-                "controller_sha256": sha256_file(Path(__file__)),
-            },
-            "isolation": isolation,
-        }
-    )
-    _write_json(session_dir / "session.json", record)
-    executor = runtime.execute_agent or _execute_agent
+    endpoint: BrokerEndpoint | None = None
+    execution: ExecutionResult | None = None
+    lifecycle_failure: Exception | None = None
+    broker_failure: str | None = None
     try:
+        endpoint = attempt_broker.start()
+        staged_client = attempt_broker.stage_client(ATTEMPT_CLIENT)
+        policy = SandboxPolicy(
+            worktree=worktree,
+            agent_env=agent_env,
+            runtime_dir=endpoint.runtime_dir,
+            attempt_client=staged_client,
+            agent_executable=agent_executable,
+            credential_mounts=(),
+        )
+        probe_argv = runtime.build_bwrap_argv(policy, runtime.sandbox_probe_command(), {})
+        probe_result = runtime.execute_sandbox_probe(
+            probe_argv,
+            worktree,
+            os.environ.copy(),
+            _PROBE_TIMEOUT_S,
+        )
+        probe_ok, probe_errors = native_sandbox.verify_sandbox_probe(probe_result)
+        if not probe_ok:
+            raise ControllerError(
+                "SANDBOX_PROBE",
+                f"sandbox probe did not match the required contract: {list(probe_errors)}",
+            )
+        vendor_command = agent_cmd_campaign(args.agent, args.model, prompt)
+        vendor_command[0] = "/opt/aisle/agent"
+        command = runtime.build_bwrap_argv(policy, vendor_command, os.environ.copy())
+        isolation = {
+            **component_hashes,
+            "broker_id": endpoint.broker_id,
+            "credential_sha256": endpoint.credential_sha256,
+            "socket_inode": endpoint.socket_inode,
+            "socket_ctime_ns": endpoint.socket_ctime_ns,
+            "socket_identity_sha256": endpoint.socket_identity_sha256,
+            "broker_started_at_epoch": endpoint.started_at_epoch,
+            "credential_expires_at_epoch": endpoint.expires_at_epoch,
+            "staged_client_sha256": sha256_file(staged_client),
+            "namespace_probe": probe_result,
+            "namespace_probe_sha256": _sha256_text(_canonical_json(probe_result)),
+            "probe_argv_sha256": _sha256_text(_canonical_json(probe_argv)),
+            "sandbox_argv_sha256": _sha256_text(_canonical_json(command)),
+        }
+        record.update(
+            {
+                "state": "running",
+                "agent": args.agent,
+                "model": args.model,
+                "budgets": budgets,
+                "run_prompt_sha256": _sha256_text(prompt),
+                "started_at_epoch": started_at_epoch,
+                "episode_reservation_sha256": reservation_hash,
+                "attempt_broker": {
+                    "credential_sha256": endpoint.credential_sha256,
+                    "broker_id": endpoint.broker_id,
+                    "socket_identity_sha256": endpoint.socket_identity_sha256,
+                    "controller_sha256": sha256_file(Path(__file__)),
+                },
+                "isolation": isolation,
+            }
+        )
+        _write_json(session_dir / "session.json", record)
+        executor = runtime.execute_agent or _execute_agent
         execution = executor(
             command,
             worktree,
@@ -1459,8 +2249,19 @@ def _run(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
             args.wall_h * 3600.0,
             attempt_broker.environment(),
         )
-    except ControllerError:
+    except Exception as exc:  # noqa: BLE001 - normalize after unconditional cleanup
+        lifecycle_failure = exc
+    finally:
+        broker_failure = attempt_broker.fatal_reason
         broker_clean = attempt_broker.stop()
+        cleanup_evidence = _isolation_cleanup_evidence(
+            runtime,
+            attempt_broker,
+            endpoint,
+            execution,
+        )
+
+    if lifecycle_failure is not None:
         record.update(
             {
                 "state": "agent_stopped",
@@ -1468,25 +2269,25 @@ def _run(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
                 "stop_reason": "infrastructure",
                 "tokens_spent": None,
                 "telemetry": {"valid": False, "ledger_head": ledger_head},
-                "isolation_cleanup": {
-                    "broker_stopped": broker_clean,
-                    "credential_revoked": not endpoint.credential_path.exists(),
-                    "socket_removed": not endpoint.socket_path.exists(),
-                    "process_group_clean": False,
-                },
+                "isolation_cleanup": cleanup_evidence,
             }
         )
         _write_json(session_dir / "session.json", record)
-        raise
-    broker_failure = attempt_broker.fatal_reason
-    broker_clean = attempt_broker.stop()
+        if isinstance(lifecycle_failure, ControllerError):
+            raise lifecycle_failure
+        raise ControllerError(
+            "SANDBOX_STARTUP",
+            f"isolated agent lifecycle failed: {type(lifecycle_failure).__name__}",
+        ) from lifecycle_failure
+
+    assert endpoint is not None and execution is not None
     if broker_failure is not None and execution.stopped == "agent_done":
         execution = ExecutionResult(
             stopped=broker_failure,
             returncode=execution.returncode,
             wall_s=execution.wall_s,
             agent_version=execution.agent_version,
-            process_group_clean=execution.process_group_clean,
+            sandbox_identity=execution.sandbox_identity,
         )
 
     telemetry_valid = execution.stopped != "telemetry_invalid" and usage_events > 0
@@ -1520,12 +2321,7 @@ def _run(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
                 "ledger_head": ledger_head,
             },
             "post_run_frozen_drift": frozen_drift,
-            "isolation_cleanup": {
-                "broker_stopped": broker_clean,
-                "credential_revoked": not endpoint.credential_path.exists(),
-                "socket_removed": not endpoint.socket_path.exists(),
-                "process_group_clean": execution.process_group_clean,
-            },
+            "isolation_cleanup": cleanup_evidence,
         }
     )
     record["artifact_sha256"].update(
@@ -1575,7 +2371,7 @@ def _run(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
             ),
             "session": record["session_id"],
         }
-    if not broker_clean or not execution.process_group_clean:
+    if not broker_clean or not _cleanup_evidence_valid(cleanup_evidence, runtime):
         return {
             "ok": False,
             "code": "SANDBOX_CLEANUP",
@@ -1694,6 +2490,67 @@ def _validate_development_result(
     return canonical
 
 
+def _adapter_cleanup(
+    runtime: ControllerRuntime,
+    before: tuple[dict, ...],
+) -> dict:
+    prior = {_canonical_json(identity) for identity in before}
+    identities = [
+        identity
+        for identity in runtime.descendant_identities()
+        if _canonical_json(identity) not in prior
+    ]
+    for identity in identities:
+        runtime.terminate_owned_identity(identity)
+    evidence = [runtime.inspect_owned_identity(identity) for identity in identities]
+    core = {
+        "schema_version": 1,
+        "identities": identities,
+        "evidence": evidence,
+        "checked_at_epoch": runtime.epoch_time(),
+    }
+    core["evidence_sha256"] = _sha256_text(_canonical_json(core))
+    return core
+
+
+def _adapter_cleanup_valid(cleanup: object, runtime: ControllerRuntime) -> bool:
+    if (
+        not isinstance(cleanup, dict)
+        or set(cleanup)
+        != {
+            "schema_version",
+            "identities",
+            "evidence",
+            "checked_at_epoch",
+            "evidence_sha256",
+        }
+        or cleanup.get("schema_version") != 1
+        or not _evidence_hash_valid(cleanup)
+        or not isinstance(cleanup.get("identities"), list)
+        or not isinstance(cleanup.get("evidence"), list)
+        or len(cleanup["identities"]) != len(cleanup["evidence"])
+    ):
+        return False
+    for identity, evidence in zip(
+        cleanup["identities"],
+        cleanup["evidence"],
+        strict=True,
+    ):
+        if (
+            evidence.get("identity") != identity
+            or not _evidence_hash_valid(evidence)
+            or evidence.get("status") not in {"absent", "pid_reused"}
+        ):
+            return False
+        current = runtime.inspect_owned_identity(identity)
+        if not _evidence_hash_valid(current) or current.get("status") not in {
+            "absent",
+            "pid_reused",
+        }:
+            return False
+    return True
+
+
 def _execute_authorized_attempt(
     session_dir: Path,
     authorized: AuthorizedAttempt,
@@ -1715,11 +2572,10 @@ def _execute_authorized_attempt(
         raise ControllerError("ARTIFACT_INVALID", "session development budget is invalid")
     worktree = Path(str(record.get("worktree", ""))).resolve()
     candidate = (worktree / authorized.candidate_relpath).resolve(strict=True)
-    if (
-        candidate != authorized.candidate
-        or not candidate.is_relative_to(worktree)
-        or not hmac.compare_digest(sha256_file(candidate), authorized.candidate_sha256)
-    ):
+    if candidate != authorized.candidate or not candidate.is_relative_to(worktree):
+        raise ControllerError("CANDIDATE_PATH", "candidate path changed after authorization")
+    capture = _capture_candidate_fd(worktree, authorized.candidate_relpath)
+    if not hmac.compare_digest(capture.sha256, authorized.candidate_sha256):
         raise ControllerError("CANDIDATE_HASH", "candidate changed after authorization")
     attempts_path = session_dir / "attempts.jsonl"
     _, _, charged = _attempt_ledger_state(session_dir)
@@ -1729,7 +2585,13 @@ def _execute_authorized_attempt(
         )
 
     attempt_id = f"dev-{record['session_id']}-{authorized.nonce}"
-    run_dir = worktree / "runs" / attempt_id
+    snapshot = _create_attempt_snapshot(
+        session_dir,
+        record,
+        attempt_id,
+        capture,
+    )
+    run_dir = snapshot.root / "runs" / attempt_id
     if run_dir.exists():
         raise ControllerError("ATTEMPT_RUN_COLLISION", "attempt run ID already exists")
     admitted_at = runtime.epoch_time()
@@ -1742,6 +2604,10 @@ def _execute_authorized_attempt(
         "condition": record["condition"],
         "candidate_relpath": authorized.candidate_relpath,
         "candidate_sha256": authorized.candidate_sha256,
+        "candidate_capture": capture.evidence(),
+        "snapshot_relpath": snapshot.root.relative_to(session_dir).as_posix(),
+        "snapshot_tree_sha256": snapshot.tree_sha256,
+        "trusted_template_sha256": snapshot.trusted_template_sha256,
         "seed_domain": authorized.seed_domain,
         "seeds": list(authorized.seeds),
         "requested_episodes": len(authorized.seeds),
@@ -1749,19 +2615,42 @@ def _execute_authorized_attempt(
     }
     admission_hash = append_ledger(session_dir / "agent.jsonl", admission_event)
 
-    adapter = runtime.adapter_factory(record["condition"], worktree)
+    _, pre_adapter_tree_sha256 = _source_tree_manifest(snapshot.root)
+    if pre_adapter_tree_sha256 != snapshot.tree_sha256:
+        raise ControllerError("SOURCE_SNAPSHOT", "attempt snapshot changed before adapter launch")
+    descendants_before = runtime.descendant_identities()
+    adapter = runtime.adapter_factory(record["condition"], snapshot.root)
     simulator_started_at = runtime.epoch_time()
-    with _simulator_authority():
-        raw_attempt = adapter.rollout(
-            candidate,
-            ",".join(str(seed) for seed in authorized.seeds),
-            attempt_id,
+    try:
+        with _simulator_authority():
+            raw_attempt = adapter.rollout(
+                snapshot.candidate,
+                ",".join(str(seed) for seed in authorized.seeds),
+                attempt_id,
+            )
+    finally:
+        adapter_cleanup = _adapter_cleanup(runtime, descendants_before)
+        adapter_cleanup_sha256 = append_ledger(
+            session_dir / "agent.jsonl",
+            {
+                "kind": "dev_attempt_process_cleanup",
+                "attempt_id": attempt_id,
+                "nonce": authorized.nonce,
+                "request_sha256": authorized.request_sha256,
+                "admission_sha256": admission_hash,
+                "cleanup": adapter_cleanup,
+            },
         )
     simulator_ended_at = runtime.epoch_time()
+    if not _adapter_cleanup_valid(adapter_cleanup, runtime):
+        raise ControllerError("ADAPTER_CLEANUP", "adapter child cleanup could not be proved")
+    _, post_adapter_tree_sha256 = _source_tree_manifest(snapshot.root)
+    if post_adapter_tree_sha256 != snapshot.tree_sha256:
+        raise ControllerError("SOURCE_SNAPSHOT", "attempt snapshot changed during adapter launch")
     attempt = _validate_development_result(
         raw_attempt,
         attempt_id=attempt_id,
-        candidate_hash=authorized.candidate_sha256,
+        candidate_hash=capture.sha256,
         requested_seeds=authorized.seeds,
     )
     attempt_raw = attempt.to_dict()
@@ -1788,16 +2677,23 @@ def _execute_authorized_attempt(
             "credential_sha256": credential_sha256,
             "admission_sha256": admission_hash,
             "candidate_relpath": authorized.candidate_relpath,
-            "candidate_sha256": authorized.candidate_sha256,
+            "candidate_sha256": capture.sha256,
+            "candidate_capture": capture.evidence(),
+            "snapshot_relpath": snapshot.root.relative_to(session_dir).as_posix(),
+            "snapshot_tree_sha256": snapshot.tree_sha256,
+            "trusted_template_sha256": snapshot.trusted_template_sha256,
             "requested_seeds": list(authorized.seeds),
             "actual_episodes": len(attempt.episodes),
             "attempt_sha256": attempt_hash,
             "adapter_manifest_sha256": adapter_manifest_hash,
+            "adapter_cleanup": adapter_cleanup,
+            "adapter_cleanup_ledger_sha256": adapter_cleanup_sha256,
             "simulator_started_at_epoch": simulator_started_at,
             "simulator_ended_at_epoch": simulator_ended_at,
         },
     )
     controller_manifest_hash = sha256_file(controller_manifest)
+    _make_tree_readonly(snapshot.root, keep_runs_writable=False)
     append_ledger(
         session_dir / "agent.jsonl",
         {
@@ -1811,6 +2707,11 @@ def _execute_authorized_attempt(
             "attempt_sha256": attempt_hash,
             "controller_manifest_sha256": controller_manifest_hash,
             "adapter_manifest_sha256": adapter_manifest_hash,
+            "adapter_cleanup_sha256": adapter_cleanup["evidence_sha256"],
+            "adapter_cleanup_ledger_sha256": adapter_cleanup_sha256,
+            "snapshot_relpath": snapshot.root.relative_to(session_dir).as_posix(),
+            "snapshot_tree_sha256": snapshot.tree_sha256,
+            "trusted_template_sha256": snapshot.trusted_template_sha256,
             "simulator_started_at_epoch": simulator_started_at,
             "simulator_ended_at_epoch": simulator_ended_at,
             "settled_at_epoch": runtime.epoch_time(),
@@ -1956,6 +2857,7 @@ def _score_locked(
         "frozen_source_sha256": component_hashes["frozen_source_sha256"],
         "controller_manifest_sha256": None,
         "adapter_manifest_sha256": None,
+        "adapter_cleanup": None,
     }
     record["state"] = "scoring_started"
     record["scoring_admission"] = admission
@@ -1979,6 +2881,16 @@ def _score_locked(
                 "HOLDOUT_RUN_COLLISION", "held-out run ID existed before scoring admission"
             )
         if not candidate.is_file():
+            adapter_cleanup = _adapter_cleanup(
+                runtime,
+                runtime.descendant_identities(),
+            )
+            if not _adapter_cleanup_valid(adapter_cleanup, runtime):
+                raise ControllerError(
+                    "ADAPTER_CLEANUP",
+                    "held-out adapter child cleanup could not be proved",
+                )
+            admission["adapter_cleanup"] = adapter_cleanup
             result = {
                 "ok": True,
                 "state": "complete",
@@ -1990,9 +2902,18 @@ def _score_locked(
             }
             error_code = None
         else:
+            descendants_before = runtime.descendant_identities()
             adapter = runtime.adapter_factory(record["condition"], worktree)
-            with _simulator_authority():
-                raw_attempt = adapter.rollout(candidate, HELDOUT_SEEDS, run_id)
+            try:
+                with _simulator_authority():
+                    raw_attempt = adapter.rollout(candidate, HELDOUT_SEEDS, run_id)
+            finally:
+                adapter_cleanup = _adapter_cleanup(runtime, descendants_before)
+            if not _adapter_cleanup_valid(adapter_cleanup, runtime):
+                raise ControllerError(
+                    "ADAPTER_CLEANUP",
+                    "held-out adapter child cleanup could not be proved",
+                )
             attempt = _validate_holdout_attempt(
                 raw_attempt,
                 run_id=run_id,
@@ -2024,6 +2945,7 @@ def _score_locked(
                     "frozen_source_sha256": admission["frozen_source_sha256"],
                     "attempt_sha256": attempt_sha256,
                     "adapter_manifest_sha256": adapter_manifest_hash,
+                    "adapter_cleanup": adapter_cleanup,
                 },
             )
             admission.update(
@@ -2032,6 +2954,7 @@ def _score_locked(
                     "attempt_sha256": attempt_sha256,
                     "controller_manifest_sha256": sha256_file(controller_manifest),
                     "adapter_manifest_sha256": adapter_manifest_hash,
+                    "adapter_cleanup": adapter_cleanup,
                 }
             )
     except Exception as exc:
@@ -2130,27 +3053,40 @@ def _budget_authority_valid(worktree: Path, record: dict, entries: list[dict]) -
 
 
 def _attempt_correlation(
+    session_dir: Path,
     worktree: Path,
     record: dict,
     attempts: list[dict],
     agent_entries: list[dict],
+    runtime: ControllerRuntime,
 ) -> tuple[set[str], set[str], int]:
     issues: set[str] = set()
     admissions: dict[str, list[dict]] = {}
     settlements: dict[str, list[dict]] = {}
+    process_cleanups: dict[str, list[dict]] = {}
     authenticated_nonces: list[int] = []
     for entry in agent_entries:
         event = entry.get("event")
         if not isinstance(event, dict):
             continue
         kind = event.get("kind")
-        if kind not in {"dev_attempt_admit", "dev_attempt_settle"}:
+        if kind not in {
+            "dev_attempt_admit",
+            "dev_attempt_settle",
+            "dev_attempt_process_cleanup",
+        }:
             continue
         attempt_id = event.get("attempt_id")
         if not isinstance(attempt_id, str):
             issues.add("ATTEMPT_CORRELATION_INVALID")
             continue
-        destination = admissions if kind == "dev_attempt_admit" else settlements
+        destination = (
+            admissions
+            if kind == "dev_attempt_admit"
+            else settlements
+            if kind == "dev_attempt_settle"
+            else process_cleanups
+        )
         destination.setdefault(attempt_id, []).append(entry)
         if kind == "dev_attempt_admit":
             nonce = event.get("nonce")
@@ -2203,18 +3139,26 @@ def _attempt_correlation(
             continue
         charged_episodes += actual_episodes
 
-    all_ids = set(admissions) | set(settlements) | set(attempt_records)
+    all_ids = set(admissions) | set(settlements) | set(process_cleanups) | set(attempt_records)
     for attempt_id in all_ids:
         admission_records = admissions.get(attempt_id, [])
         settlement_records = settlements.get(attempt_id, [])
+        cleanup_records = process_cleanups.get(attempt_id, [])
         attempt_record = attempt_records.get(attempt_id)
-        if len(admission_records) != 1 or len(settlement_records) != 1 or attempt_record is None:
+        if (
+            len(admission_records) != 1
+            or len(settlement_records) != 1
+            or len(cleanup_records) != 1
+            or attempt_record is None
+        ):
             issues.add("ATTEMPT_CORRELATION_INVALID")
             continue
 
         admission_entry = admission_records[0]
         admission = admission_entry["event"]
         settlement = settlement_records[0]["event"]
+        cleanup_entry = cleanup_records[0]
+        cleanup_event = cleanup_entry["event"]
         raw, attempt = attempt_record
         requested = admission.get("seeds")
         requested_is_valid = (
@@ -2232,7 +3176,22 @@ def _attempt_correlation(
             continue
         episode_seeds = [episode.get("seed") for episode in attempt.episodes]
         attempt_hash = _sha256_text(_canonical_json(raw))
-        controller_manifest = worktree / "runs" / attempt_id / "controller_attempt.json"
+        snapshot_relpath = admission.get("snapshot_relpath")
+        if not isinstance(snapshot_relpath, str):
+            issues.add("ATTEMPT_CORRELATION_INVALID")
+            continue
+        try:
+            snapshot = (session_dir / snapshot_relpath).resolve(strict=True)
+            expected_snapshot = (session_dir / "attempt-snapshots" / attempt_id).resolve(
+                strict=True
+            )
+        except OSError:
+            issues.add("ATTEMPT_CORRELATION_INVALID")
+            continue
+        if snapshot != expected_snapshot or not snapshot.is_relative_to(session_dir):
+            issues.add("ATTEMPT_CORRELATION_INVALID")
+            continue
+        controller_manifest = snapshot / "runs" / attempt_id / "controller_attempt.json"
         if not controller_manifest.is_file():
             issues.add("ATTEMPT_CORRELATION_INVALID")
             continue
@@ -2241,11 +3200,17 @@ def _attempt_correlation(
         except ControllerError:
             issues.add("ATTEMPT_CORRELATION_INVALID")
             continue
-        adapter_manifest = worktree / "runs" / attempt_id / "manifest.json"
+        adapter_manifest = snapshot / "runs" / attempt_id / "manifest.json"
         adapter_manifest_hash = (
             sha256_file(adapter_manifest) if adapter_manifest.is_file() else None
         )
         actual = len(attempt.episodes)
+        try:
+            _, current_snapshot_sha256 = _source_tree_manifest(snapshot)
+            snapshot_manifest = _load_json(snapshot / "controller_snapshot.json")
+        except ControllerError:
+            issues.add("ATTEMPT_CORRELATION_INVALID")
+            continue
         if (
             any(isinstance(seed, bool) or not isinstance(seed, int) for seed in episode_seeds)
             or episode_seeds != requested[:actual]
@@ -2255,6 +3220,13 @@ def _attempt_correlation(
             or settlement.get("requested_episodes") != len(requested)
             or settlement.get("attempt_sha256") != attempt_hash
             or settlement.get("admission_sha256") != admission_entry.get("sha256")
+            or cleanup_event.get("admission_sha256") != admission_entry.get("sha256")
+            or cleanup_event.get("nonce") != admission.get("nonce")
+            or cleanup_event.get("request_sha256") != admission.get("request_sha256")
+            or not _adapter_cleanup_valid(cleanup_event.get("cleanup"), runtime)
+            or settlement.get("adapter_cleanup_sha256")
+            != cleanup_event.get("cleanup", {}).get("evidence_sha256")
+            or settlement.get("adapter_cleanup_ledger_sha256") != cleanup_entry.get("sha256")
             or settlement.get("controller_manifest_sha256") != sha256_file(controller_manifest)
             or settlement.get("adapter_manifest_sha256") != adapter_manifest_hash
             or admission.get("candidate_sha256") != attempt.candidate_hash
@@ -2262,6 +3234,16 @@ def _attempt_correlation(
             != (record.get("attempt_broker") or {}).get("credential_sha256")
             or admission.get("nonce") != settlement.get("nonce")
             or admission.get("request_sha256") != settlement.get("request_sha256")
+            or admission.get("snapshot_relpath") != settlement.get("snapshot_relpath")
+            or admission.get("snapshot_tree_sha256") != current_snapshot_sha256
+            or settlement.get("snapshot_tree_sha256") != current_snapshot_sha256
+            or admission.get("trusted_template_sha256") != record.get("trusted_template_sha256")
+            or settlement.get("trusted_template_sha256") != record.get("trusted_template_sha256")
+            or snapshot_manifest.get("tree_sha256") != current_snapshot_sha256
+            or snapshot_manifest.get("trusted_template_sha256")
+            != record.get("trusted_template_sha256")
+            or snapshot_manifest.get("candidate_sha256") != attempt.candidate_hash
+            or admission.get("candidate_capture") != snapshot_manifest.get("candidate_capture")
             or manifest.get("attempt_id") != attempt_id
             or manifest.get("session_id") != record.get("session_id")
             or manifest.get("condition") != record.get("condition")
@@ -2270,10 +3252,16 @@ def _attempt_correlation(
             or manifest.get("request_sha256") != admission.get("request_sha256")
             or manifest.get("credential_sha256") != admission.get("credential_sha256")
             or manifest.get("candidate_sha256") != attempt.candidate_hash
+            or manifest.get("snapshot_relpath") != snapshot_relpath
+            or manifest.get("snapshot_tree_sha256") != current_snapshot_sha256
+            or manifest.get("trusted_template_sha256") != record.get("trusted_template_sha256")
+            or manifest.get("candidate_capture") != admission.get("candidate_capture")
             or manifest.get("requested_seeds") != requested
             or manifest.get("actual_episodes") != actual
             or manifest.get("attempt_sha256") != attempt_hash
             or manifest.get("adapter_manifest_sha256") != adapter_manifest_hash
+            or manifest.get("adapter_cleanup") != cleanup_event.get("cleanup")
+            or manifest.get("adapter_cleanup_ledger_sha256") != cleanup_entry.get("sha256")
         ):
             issues.add("ATTEMPT_CORRELATION_INVALID")
             continue
@@ -2325,6 +3313,7 @@ def _authorized_holdout(worktree: Path, record: dict) -> str | None:
         or manifest.get("frozen_source_sha256") != admission.get("frozen_source_sha256")
         or manifest.get("adapter_manifest_sha256") != adapter_manifest_hash
         or admission.get("adapter_manifest_sha256") != adapter_manifest_hash
+        or manifest.get("adapter_cleanup") != admission.get("adapter_cleanup")
     ):
         return None
     return run_id
@@ -2407,6 +3396,8 @@ def _audit_session(
     configured_root = Path(str(record.get("worktrees_root", ""))).resolve(strict=False)
     if (
         worktree.parent != configured_root
+        or worktree.name != record.get("session_id")
+        or session_dir.name != record.get("session_id")
         or record.get("worktrees_root_sha256") != _sha256_text(str(configured_root))
         or record.get("worktree_path_sha256") != _sha256_text(str(worktree))
     ):
@@ -2447,12 +3438,7 @@ def _audit_session(
         ):
             issues.append("SANDBOX_PROBE_INVALID")
         cleanup = record.get("isolation_cleanup")
-        if not isinstance(cleanup, dict) or cleanup != {
-            "broker_stopped": True,
-            "credential_revoked": True,
-            "socket_removed": True,
-            "process_group_clean": True,
-        }:
+        if not _cleanup_evidence_valid(cleanup, runtime):
             issues.append("SANDBOX_CLEANUP_INVALID")
     if record.get("state") != "prepared":
         try:
@@ -2472,6 +3458,18 @@ def _audit_session(
     starter = worktree / str(record.get("starter", ""))
     if not starter.is_file() or provenance.get("starter_sha256") != sha256_file(starter):
         issues.append("STARTER_DRIFT")
+    trusted_template: Path | None = None
+    try:
+        trusted_template = (session_dir / str(record.get("trusted_template", ""))).resolve(
+            strict=True
+        )
+        _, trusted_template_sha256 = _source_tree_manifest(trusted_template)
+    except (ControllerError, OSError):
+        trusted_template_sha256 = None
+    if trusted_template != (session_dir / "trusted-source").resolve(
+        strict=False
+    ) or trusted_template_sha256 != record.get("trusted_template_sha256"):
+        issues.append("SOURCE_SNAPSHOT_INVALID")
     if provenance.get("seed_sha256") != _seed_hashes():
         issues.append("SEED_DRIFT")
     if runtime.worktree_head(worktree) != record.get("pin"):
@@ -2547,10 +3545,12 @@ def _audit_session(
             development_run_ids,
             development_episodes,
         ) = _attempt_correlation(
+            session_dir,
             worktree,
             record,
             attempts,
             agent_entries,
+            runtime,
         )
         issues.extend(correlation_issues)
 
@@ -2560,7 +3560,13 @@ def _audit_session(
     if record.get("state") in {"scoring_started", "scoring_invalid"}:
         issues.append("SCORING_TERMINAL_INVALID")
         exclusions.append("SCORING_TERMINAL_INVALID")
-    if record.get("state") == "scored" and _authorized_holdout(worktree, record) is None:
+    if record.get("state") == "scored" and (
+        _authorized_holdout(worktree, record) is None
+        or not _adapter_cleanup_valid(
+            (record.get("scoring_admission") or {}).get("adapter_cleanup"),
+            runtime,
+        )
+    ):
         issues.append("SCORING_ATTRIBUTION_INVALID")
         exclusions.append("SCORING_ATTRIBUTION_INVALID")
     if record.get("observed_unowned_launch"):

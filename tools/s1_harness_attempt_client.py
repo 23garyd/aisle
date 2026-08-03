@@ -15,6 +15,11 @@ import time
 from pathlib import Path
 
 _MAX_MESSAGE_BYTES = 1024 * 1024
+_MAX_SEED_COUNT = 256
+_MAX_SEED_CSV_BYTES = 4096
+_MAX_SEED_DIGITS = 20
+_MAX_SESSION_ID_BYTES = 256
+_MAX_CANDIDATE_RELPATH_BYTES = 4096
 _CONFIG_KEYS = frozenset(
     {
         "protocol",
@@ -85,11 +90,13 @@ def _read_config(path: Path, now_epoch: float) -> dict:
         or isinstance(value["protocol"], bool)
         or not isinstance(value["session_id"], str)
         or not value["session_id"]
+        or len(value["session_id"].encode("utf-8")) > _MAX_SESSION_ID_BYTES
         or value["condition"] not in {"aisle", "script"}
         or not isinstance(value["credential"], str)
         or _SHA256.fullmatch(value["credential"]) is None
         or not isinstance(value["candidate_relpath"], str)
         or not value["candidate_relpath"]
+        or len(value["candidate_relpath"].encode("utf-8")) > _MAX_CANDIDATE_RELPATH_BYTES
         or isinstance(expires, bool)
         or not isinstance(expires, (int, float))
         or not math.isfinite(float(expires))
@@ -103,10 +110,17 @@ def _read_config(path: Path, now_epoch: float) -> dict:
 def _seed_csv(spec: str) -> tuple[int, ...]:
     if not isinstance(spec, str) or not spec:
         raise AttemptClientError("SEEDS", "seeds must be a non-empty CSV")
+    if len(spec.encode("utf-8")) > _MAX_SEED_CSV_BYTES:
+        raise AttemptClientError("SEEDS", "seed CSV exceeds the size limit")
     pieces = spec.split(",")
-    if any(_SEED.fullmatch(piece) is None for piece in pieces):
+    if len(pieces) > _MAX_SEED_COUNT:
+        raise AttemptClientError("SEEDS", "seed CSV contains too many values")
+    if any(len(piece) > _MAX_SEED_DIGITS or _SEED.fullmatch(piece) is None for piece in pieces):
         raise AttemptClientError("SEEDS", "seeds must be decimal CSV values")
-    values = tuple(int(piece) for piece in pieces)
+    try:
+        values = tuple(int(piece) for piece in pieces)
+    except (OverflowError, ValueError) as exc:
+        raise AttemptClientError("SEEDS", "seeds could not be converted to integers") from exc
     if len(set(values)) != len(values):
         raise AttemptClientError("SEEDS", "seeds must be unique")
     return values
@@ -168,6 +182,9 @@ def build_request(
         "seeds": seeds,
     }
     assert set(request) == _REQUEST_KEYS
+    encoded = json.dumps(request, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    if len(encoded) > _MAX_MESSAGE_BYTES:
+        raise AttemptClientError("PROTOCOL", "request exceeds the size limit")
     return request
 
 
@@ -206,6 +223,8 @@ def _exchange(socket_path: Path, request: dict, timeout_s: float) -> dict:
     encoded = (
         json.dumps(request, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
     ).encode()
+    if len(encoded) > _MAX_MESSAGE_BYTES:
+        raise AttemptClientError("PROTOCOL", "request exceeds the size limit")
     received = bytearray()
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:

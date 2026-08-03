@@ -44,7 +44,14 @@ class ConditionAdapter(Protocol):
 
 
 def _run_command(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        start_new_session=True,
+    )
 
 
 def _parse_single_json(stdout: object) -> dict | None:
