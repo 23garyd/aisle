@@ -3247,3 +3247,109 @@ def test_native_sandbox_negative_probes_distinguish_successful_absence(monkeypat
         "dora_executable": False,
         "other_worktree_visible": False,
     }
+
+
+def _sandbox_probe_with_import_locations(source: str, locations: tuple[object, ...]) -> str:
+    marker = "HOST_PID_NAMESPACE ="
+    controlled = source.replace(
+        marker,
+        f"IMPORT_SEARCH_LOCATIONS = {locations!r}\n\n{marker}",
+        1,
+    )
+    assert controlled != source
+    return controlled
+
+
+def test_native_sandbox_genesis_probe_rejects_unreadable_import_directory(
+    tmp_path: Path, monkeypatch
+):
+    """Native isolation design: FileFinder-suppressed PermissionError remains invalid."""
+    from aisle.harness.native_sandbox import sandbox_probe_command, verify_sandbox_probe
+
+    unreadable = tmp_path / "unreadable-import-root"
+    unreadable.mkdir()
+    unreadable.chmod(0o000)
+    source = _sandbox_probe_with_import_locations(sandbox_probe_command()[3], (str(unreadable),))
+    original_scandir = os.scandir
+    find_spec_calls: list[str] = []
+
+    def permission_denied(path):
+        if Path(path) == unreadable:
+            raise PermissionError("fixture unreadable import directory")
+        return original_scandir(path)
+
+    monkeypatch.setattr("os.scandir", permission_denied)
+    monkeypatch.setattr(
+        "importlib.util.find_spec",
+        lambda name: find_spec_calls.append(name) or None,
+    )
+    monkeypatch.setattr("socket.getaddrinfo", lambda *args, **kwargs: [])
+
+    try:
+        result = _execute_native_sandbox_probe(source)
+        ok, errors = verify_sandbox_probe(result)
+    finally:
+        unreadable.chmod(0o700)
+
+    assert result["genesis_importable"] is None
+    assert find_spec_calls == []
+    assert ok is False
+    assert any("genesis_importable" in error for error in errors)
+
+
+@pytest.mark.parametrize("malformed_location", [None, "", "ordinary-file"])
+def test_native_sandbox_genesis_probe_rejects_malformed_import_locations(
+    tmp_path: Path, monkeypatch, malformed_location: object
+):
+    """Native isolation design: non-path, empty, and non-archive files fail closed."""
+    from aisle.harness.native_sandbox import sandbox_probe_command
+
+    if malformed_location == "ordinary-file":
+        location: object = str(tmp_path / "not-an-import-archive")
+        Path(location).write_text("not a zip archive\n")
+    else:
+        location = malformed_location
+    source = _sandbox_probe_with_import_locations(sandbox_probe_command()[3], (location,))
+    find_spec_calls: list[str] = []
+    monkeypatch.setattr(
+        "importlib.util.find_spec",
+        lambda name: find_spec_calls.append(name) or None,
+    )
+    monkeypatch.setattr("socket.getaddrinfo", lambda *args, **kwargs: [])
+
+    result = _execute_native_sandbox_probe(source)
+
+    assert result["genesis_importable"] is None
+    assert find_spec_calls == []
+
+
+def test_native_sandbox_genesis_probe_allows_confirmed_nonexistent_import_path(
+    tmp_path: Path, monkeypatch
+):
+    """Native isolation design: a stat-confirmed missing search entry cannot hide Genesis."""
+    from aisle.harness.native_sandbox import sandbox_probe_command
+
+    missing = tmp_path / "missing-python-zip"
+    source = _sandbox_probe_with_import_locations(sandbox_probe_command()[3], (str(missing),))
+    original_stat = Path.stat
+    inspected: list[Path] = []
+    find_spec_calls: list[str] = []
+
+    def missing_stat(path: Path, *args, **kwargs):
+        if path == missing:
+            inspected.append(path)
+            raise FileNotFoundError(path)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", missing_stat)
+    monkeypatch.setattr(
+        "importlib.util.find_spec",
+        lambda name: find_spec_calls.append(name) or None,
+    )
+    monkeypatch.setattr("socket.getaddrinfo", lambda *args, **kwargs: [])
+
+    result = _execute_native_sandbox_probe(source)
+
+    assert inspected == [missing]
+    assert find_spec_calls == ["genesis"]
+    assert result["genesis_importable"] is False

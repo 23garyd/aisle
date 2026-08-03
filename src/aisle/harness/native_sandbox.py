@@ -109,9 +109,12 @@ _PROBE_SOURCE_TEMPLATE = textwrap.dedent(
     import os
     import socket
     import stat
+    import sys
     import tempfile
+    import zipfile
     from pathlib import Path
 
+    IMPORT_SEARCH_LOCATIONS = tuple(sys.path)
     HOST_PID_NAMESPACE = __HOST_PID_NAMESPACE__
 
     def check(operation):
@@ -156,6 +159,28 @@ _PROBE_SOURCE_TEMPLATE = textwrap.dedent(
                 return True
         return False
 
+    def validate_import_search_locations():
+        for raw_location in IMPORT_SEARCH_LOCATIONS:
+            if type(raw_location) is not str or not raw_location:
+                raise ValueError("malformed import search location")
+            location = Path(raw_location).expanduser().resolve(strict=False)
+            try:
+                mode = location.stat().st_mode
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(mode):
+                with os.scandir(location) as entries:
+                    next(entries, None)
+            elif stat.S_ISREG(mode):
+                with zipfile.ZipFile(location) as archive:
+                    archive.infolist()
+            else:
+                raise OSError("unsupported import search location")
+
+    def genesis_importable():
+        validate_import_search_locations()
+        return importlib.util.find_spec("genesis") is not None
+
     result = {
         "worktree_write": check(worktree_write),
         "network_dns": check(network_dns),
@@ -170,7 +195,7 @@ _PROBE_SOURCE_TEMPLATE = textwrap.dedent(
                 )
             )
         ),
-        "genesis_importable": check(lambda: importlib.util.find_spec("genesis") is not None),
+        "genesis_importable": check(genesis_importable),
         "dora_executable": check(lambda: executable_visible("dora")),
         "other_worktree_visible": check(
             lambda: paths_visible(
