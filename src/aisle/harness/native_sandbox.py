@@ -107,8 +107,8 @@ _PROBE_SOURCE_TEMPLATE = textwrap.dedent(
     import importlib.util
     import json
     import os
-    import shutil
     import socket
+    import stat
     import tempfile
     from pathlib import Path
 
@@ -118,7 +118,7 @@ _PROBE_SOURCE_TEMPLATE = textwrap.dedent(
         try:
             return bool(operation())
         except Exception:
-            return False
+            return None
 
     def worktree_write():
         with tempfile.NamedTemporaryFile(dir="/workspace", prefix=".aisle-probe-"):
@@ -131,15 +131,39 @@ _PROBE_SOURCE_TEMPLATE = textwrap.dedent(
     def host_process_visible():
         return os.stat("/proc/self/ns/pid").st_ino == HOST_PID_NAMESPACE
 
+    def paths_visible(paths):
+        for path in paths:
+            try:
+                path.stat()
+            except FileNotFoundError:
+                continue
+            return True
+        return False
+
+    def nvidia_visible():
+        return any(entry.name.startswith("nvidia") for entry in Path("/dev").iterdir())
+
+    def executable_visible(name):
+        for directory in os.environ.get("PATH", "").split(os.pathsep):
+            if not directory:
+                continue
+            candidate = Path(directory) / name
+            try:
+                mode = candidate.stat().st_mode
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(mode) and mode & 0o111:
+                return True
+        return False
+
     result = {
         "worktree_write": check(worktree_write),
         "network_dns": check(network_dns),
         "host_process_visible": check(host_process_visible),
-        "nvidia_visible": check(lambda: any(Path("/dev").glob("nvidia*"))),
+        "nvidia_visible": check(nvidia_visible),
         "docker_socket_visible": check(
-            lambda: any(
-                path.exists()
-                for path in (
+            lambda: paths_visible(
+                (
                     Path("/var/run/docker.sock"),
                     Path("/run/docker.sock"),
                     Path("/run/containerd/containerd.sock"),
@@ -147,11 +171,10 @@ _PROBE_SOURCE_TEMPLATE = textwrap.dedent(
             )
         ),
         "genesis_importable": check(lambda: importlib.util.find_spec("genesis") is not None),
-        "dora_executable": check(lambda: shutil.which("dora") is not None),
+        "dora_executable": check(lambda: executable_visible("dora")),
         "other_worktree_visible": check(
-            lambda: any(
-                path.exists()
-                for path in (
+            lambda: paths_visible(
+                (
                     Path("/.worktrees"),
                     Path("/repo/.worktrees"),
                     Path("/worktrees"),
@@ -212,12 +235,15 @@ def _resolve_source(path: Path, label: str, *, allow_protected_descendant: bool 
     protected = tuple(source.resolve(strict=False) for source in _PROTECTED_SOURCES)
     overlaps_protected = any(_overlaps(candidate, source) for source in protected)
     if allow_protected_descendant:
-        contains_protected = any(_contains(source, candidate) for source in protected)
         worktrees_root = _WORKTREES_ROOT.resolve(strict=False)
         controller_root = _CONTROLLER_ROOT.resolve(strict=False)
-        allowed_worktree_leaf = candidate.parent == worktrees_root and candidate != controller_root
-        inside_protected = any(_contains(candidate, source) for source in protected)
-        overlaps_protected = contains_protected or (inside_protected and not allowed_worktree_leaf)
+        if candidate.parent != worktrees_root or candidate == controller_root:
+            raise ValueError(
+                "worktree must be a direct child of the configured worktrees root "
+                "and distinct from the controller"
+            )
+        contains_protected = any(_contains(source, candidate) for source in protected)
+        overlaps_protected = contains_protected
     if overlaps_protected:
         raise ValueError(f"{label} overlaps a protected host source: {candidate}")
     if not candidate.exists():

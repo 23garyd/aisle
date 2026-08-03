@@ -2653,10 +2653,31 @@ def test_controller_help_is_one_success_json_object(argv: list[str]):
     assert stdout.getvalue().count("\n") == 1
 
 
-def _native_sandbox_policy(tmp_path: Path, *, agent_name: str = "claude"):
+@pytest.fixture
+def native_sandbox_worktrees_root(tmp_path: Path, monkeypatch) -> Path:
+    from aisle.harness import native_sandbox
+
+    repository = tmp_path / "sandbox-policy-repository"
+    worktrees_root = repository / ".worktrees"
+    controller = worktrees_root / "trusted-controller"
+    host_venv = repository / ".venv"
+    for directory in (worktrees_root, controller, host_venv):
+        directory.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(native_sandbox, "_CONTROLLER_ROOT", controller)
+    monkeypatch.setattr(native_sandbox, "_WORKTREES_ROOT", worktrees_root)
+    monkeypatch.setattr(native_sandbox, "_HOST_SIMULATION_ENV", host_venv)
+    monkeypatch.setattr(
+        native_sandbox,
+        "_PROTECTED_SOURCES",
+        (controller, worktrees_root, host_venv),
+    )
+    return worktrees_root
+
+
+def _native_sandbox_policy(tmp_path: Path, worktrees_root: Path, *, agent_name: str = "claude"):
     from aisle.harness.native_sandbox import SandboxPolicy
 
-    worktree = tmp_path / "assigned-session-worktree"
+    worktree = worktrees_root / "assigned-session-worktree"
     agent_env = tmp_path / "minimal-agent-environment"
     runtime_dir = tmp_path / "private-attempt-runtime"
     client = tmp_path / "immutable-attempt-client"
@@ -2683,11 +2704,13 @@ def _bwrap_mounts(argv: list[str], option: str) -> list[tuple[str, str]]:
     ]
 
 
-def test_native_sandbox_builds_an_explicit_minimal_namespace(tmp_path: Path):
+def test_native_sandbox_builds_an_explicit_minimal_namespace(
+    tmp_path: Path, native_sandbox_worktrees_root: Path
+):
     """CON-5: the native isolation policy produces deterministic, explicit bwrap argv."""
     from aisle.harness.native_sandbox import build_bwrap_argv
 
-    policy = _native_sandbox_policy(tmp_path)
+    policy = _native_sandbox_policy(tmp_path, native_sandbox_worktrees_root)
     argv = build_bwrap_argv(
         policy,
         ["/opt/aisle/agent", "--version"],
@@ -2758,11 +2781,13 @@ def test_native_sandbox_builds_an_explicit_minimal_namespace(tmp_path: Path):
     assert "UNRELATED_HOST_SECRET" not in argv
 
 
-def test_native_sandbox_policy_is_deeply_immutable(tmp_path: Path):
+def test_native_sandbox_policy_is_deeply_immutable(
+    tmp_path: Path, native_sandbox_worktrees_root: Path
+):
     """CON-5: sandbox mount authority cannot drift after policy construction."""
     from dataclasses import FrozenInstanceError
 
-    policy = _native_sandbox_policy(tmp_path)
+    policy = _native_sandbox_policy(tmp_path, native_sandbox_worktrees_root)
 
     with pytest.raises(FrozenInstanceError):
         policy.worktree = tmp_path / "replacement"
@@ -2779,13 +2804,18 @@ def test_native_sandbox_policy_is_deeply_immutable(tmp_path: Path):
         Path("/run/containerd/containerd.sock"),
     ],
 )
-def test_native_sandbox_rejects_forbidden_bind_sources(tmp_path: Path, forbidden: Path):
+def test_native_sandbox_rejects_forbidden_bind_sources(
+    tmp_path: Path, native_sandbox_worktrees_root: Path, forbidden: Path
+):
     """Native isolation design: GPU and container-control paths fail closed."""
     from dataclasses import replace
 
     from aisle.harness.native_sandbox import build_bwrap_argv
 
-    policy = replace(_native_sandbox_policy(tmp_path), credential_mounts=(forbidden,))
+    policy = replace(
+        _native_sandbox_policy(tmp_path, native_sandbox_worktrees_root),
+        credential_mounts=(forbidden,),
+    )
 
     with pytest.raises(ValueError, match="forbidden"):
         build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
@@ -2802,39 +2832,73 @@ def test_native_sandbox_rejects_forbidden_bind_sources(tmp_path: Path, forbidden
     ],
 )
 def test_native_sandbox_rejects_pseudofs_and_forbidden_ancestors(
-    tmp_path: Path, forbidden_ancestor: Path
+    tmp_path: Path, native_sandbox_worktrees_root: Path, forbidden_ancestor: Path
 ):
     """Native isolation design: alternate mounts cannot restore host devices or processes."""
     from dataclasses import replace
 
     from aisle.harness.native_sandbox import build_bwrap_argv
 
-    policy = replace(_native_sandbox_policy(tmp_path), credential_mounts=(forbidden_ancestor,))
+    policy = replace(
+        _native_sandbox_policy(tmp_path, native_sandbox_worktrees_root),
+        credential_mounts=(forbidden_ancestor,),
+    )
 
     with pytest.raises(ValueError, match="forbidden"):
         build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
 
 
 @pytest.mark.parametrize(
-    "protected_source",
-    [
-        REPO_ROOT,
-        REPO_ROOT.parent,
-        REPO_ROOT.parent.parent / ".venv",
-    ],
+    "protected_source_name",
+    ["controller", "worktrees", "host_venv"],
 )
 def test_native_sandbox_rejects_controller_worktree_parent_and_host_venv(
-    tmp_path: Path, protected_source: Path
+    tmp_path: Path, native_sandbox_worktrees_root: Path, protected_source_name: str
 ):
     """CON-7: trusted controller, sibling-worktree parent, and simulation env stay hidden."""
     from dataclasses import replace
 
-    from aisle.harness.native_sandbox import build_bwrap_argv
+    from aisle.harness import native_sandbox
 
-    policy = replace(_native_sandbox_policy(tmp_path), credential_mounts=(protected_source,))
+    protected_sources = {
+        "controller": native_sandbox._CONTROLLER_ROOT,
+        "worktrees": native_sandbox_worktrees_root,
+        "host_venv": native_sandbox._HOST_SIMULATION_ENV,
+    }
+
+    policy = replace(
+        _native_sandbox_policy(tmp_path, native_sandbox_worktrees_root),
+        credential_mounts=(protected_sources[protected_source_name],),
+    )
 
     with pytest.raises(ValueError, match="protected"):
-        build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
+        native_sandbox.build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
+
+
+@pytest.mark.parametrize("worktree_kind", ["outside", "nested", "root", "controller"])
+def test_native_sandbox_rejects_every_non_direct_child_worktree(
+    tmp_path: Path, native_sandbox_worktrees_root: Path, worktree_kind: str
+):
+    """Native isolation design: /workspace is exactly one configured worktree leaf."""
+    from dataclasses import replace
+
+    from aisle.harness import native_sandbox
+
+    candidates = {
+        "outside": tmp_path / "outside-worktree",
+        "nested": native_sandbox_worktrees_root / "session" / "nested",
+        "root": native_sandbox_worktrees_root,
+        "controller": native_sandbox._CONTROLLER_ROOT,
+    }
+    candidate = candidates[worktree_kind]
+    candidate.mkdir(parents=True, exist_ok=True)
+    policy = replace(
+        _native_sandbox_policy(tmp_path, native_sandbox_worktrees_root),
+        worktree=candidate,
+    )
+
+    with pytest.raises(ValueError, match="worktree"):
+        native_sandbox.build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
 
 
 def test_native_sandbox_allows_one_assigned_leaf_under_worktrees_root(tmp_path: Path, monkeypatch):
@@ -2857,7 +2921,7 @@ def test_native_sandbox_allows_one_assigned_leaf_under_worktrees_root(tmp_path: 
         "_PROTECTED_SOURCES",
         (repository, worktrees_root, host_venv),
     )
-    policy = replace(_native_sandbox_policy(tmp_path), worktree=assigned)
+    policy = replace(_native_sandbox_policy(tmp_path, worktrees_root), worktree=assigned)
 
     argv = native_sandbox.build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
 
@@ -2891,17 +2955,19 @@ def test_native_sandbox_rejects_controller_and_nested_worktree_paths(
         "_PROTECTED_SOURCES",
         (repository, worktrees_root, host_venv),
     )
-    policy = replace(_native_sandbox_policy(tmp_path), worktree=candidate)
+    policy = replace(_native_sandbox_policy(tmp_path, worktrees_root), worktree=candidate)
 
-    with pytest.raises(ValueError, match="protected"):
+    with pytest.raises(ValueError, match="worktree"):
         native_sandbox.build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
 
 
-def test_native_sandbox_requires_private_uid_owned_runtime(tmp_path: Path, monkeypatch):
+def test_native_sandbox_requires_private_uid_owned_runtime(
+    tmp_path: Path, native_sandbox_worktrees_root: Path, monkeypatch
+):
     """Native isolation design: socket runtime ownership and mode are fail-closed."""
     from aisle.harness.native_sandbox import build_bwrap_argv
 
-    policy = _native_sandbox_policy(tmp_path)
+    policy = _native_sandbox_policy(tmp_path, native_sandbox_worktrees_root)
     policy.runtime_dir.chmod(0o755)
     with pytest.raises(ValueError, match="0700"):
         build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
@@ -2914,14 +2980,14 @@ def test_native_sandbox_requires_private_uid_owned_runtime(tmp_path: Path, monke
 
 @pytest.mark.parametrize("source_field", ["runtime_dir", "attempt_client"])
 def test_native_sandbox_keeps_socket_and_client_outside_writable_worktree(
-    tmp_path: Path, source_field: str
+    tmp_path: Path, native_sandbox_worktrees_root: Path, source_field: str
 ):
     """Native isolation design: broker authority cannot live in agent-writable storage."""
     from dataclasses import replace
 
     from aisle.harness.native_sandbox import build_bwrap_argv
 
-    policy = _native_sandbox_policy(tmp_path)
+    policy = _native_sandbox_policy(tmp_path, native_sandbox_worktrees_root)
     if source_field == "runtime_dir":
         source = policy.worktree / "runtime"
         source.mkdir()
@@ -2931,33 +2997,35 @@ def test_native_sandbox_keeps_socket_and_client_outside_writable_worktree(
         source.write_text("immutable only outside the worktree\n")
     policy = replace(policy, **{source_field: source})
 
-    with pytest.raises(ValueError, match="outside"):
+    with pytest.raises(ValueError, match="outside|protected"):
         build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
 
 
 @pytest.mark.parametrize("source_field", ["runtime_dir", "credential_mounts"])
 def test_native_sandbox_rejects_bind_ancestors_of_writable_worktree(
-    tmp_path: Path, source_field: str
+    tmp_path: Path, native_sandbox_worktrees_root: Path, source_field: str
 ):
     """Native isolation design: alternate mounts cannot reveal the worktree through an ancestor."""
     from dataclasses import replace
 
     from aisle.harness.native_sandbox import build_bwrap_argv
 
-    policy = _native_sandbox_policy(tmp_path)
+    policy = _native_sandbox_policy(tmp_path, native_sandbox_worktrees_root)
     tmp_path.chmod(0o700)
     replacement = tmp_path if source_field == "runtime_dir" else (tmp_path,)
     policy = replace(policy, **{source_field: replacement})
 
-    with pytest.raises(ValueError, match="outside"):
+    with pytest.raises(ValueError, match="outside|protected"):
         build_bwrap_argv(policy, ["/opt/aisle/agent"], {})
 
 
-def test_native_sandbox_selects_only_matching_vendor_auth(tmp_path: Path):
+def test_native_sandbox_selects_only_matching_vendor_auth(
+    tmp_path: Path, native_sandbox_worktrees_root: Path
+):
     """Native isolation design: vendor selection cannot leak another provider's credentials."""
     from aisle.harness.native_sandbox import build_bwrap_argv
 
-    policy = _native_sandbox_policy(tmp_path, agent_name="codex")
+    policy = _native_sandbox_policy(tmp_path, native_sandbox_worktrees_root, agent_name="codex")
     argv = build_bwrap_argv(
         policy,
         ["/opt/aisle/agent"],
@@ -3040,6 +3108,13 @@ def test_native_sandbox_probe_command_is_json_only_and_harmless():
     assert "urlopen" not in command[3]
 
 
+def _execute_native_sandbox_probe(source: str) -> dict:
+    stdout = StringIO()
+    with redirect_stdout(stdout):
+        exec(compile(source, "<sandbox-probe>", "exec"), {})
+    return json.loads(stdout.getvalue())
+
+
 def test_native_sandbox_probe_distinguishes_host_pid_namespace(monkeypatch):
     """Native isolation design: host visibility means matching trusted PID-namespace identity."""
     from aisle.harness.native_sandbox import sandbox_probe_command
@@ -3048,16 +3123,127 @@ def test_native_sandbox_probe_distinguishes_host_pid_namespace(monkeypatch):
     host_namespace = os.stat("/proc/self/ns/pid").st_ino
     source = sandbox_probe_command()[3]
 
-    def execute(probe_source: str) -> dict:
-        stdout = StringIO()
-        with redirect_stdout(stdout):
-            exec(compile(probe_source, "<sandbox-probe>", "exec"), {})
-        return json.loads(stdout.getvalue())
-
-    assert execute(source)["host_process_visible"] is True
+    assert _execute_native_sandbox_probe(source)["host_process_visible"] is True
     isolated_source = source.replace(
         f"HOST_PID_NAMESPACE = {host_namespace}",
         f"HOST_PID_NAMESPACE = {host_namespace + 1}",
     )
     assert isolated_source != source
-    assert execute(isolated_source)["host_process_visible"] is False
+    assert _execute_native_sandbox_probe(isolated_source)["host_process_visible"] is False
+
+
+@pytest.mark.parametrize(
+    "probe_key",
+    [
+        "host_process_visible",
+        "nvidia_visible",
+        "docker_socket_visible",
+        "genesis_importable",
+        "dora_executable",
+        "other_worktree_visible",
+    ],
+)
+def test_native_sandbox_negative_probe_inspection_errors_fail_closed(monkeypatch, probe_key: str):
+    """Native isolation design: inaccessible negative inspections are invalid, never safe."""
+    from aisle.harness.native_sandbox import sandbox_probe_command, verify_sandbox_probe
+
+    source = sandbox_probe_command()[3]
+    monkeypatch.setattr("socket.getaddrinfo", lambda *args, **kwargs: [])
+    if probe_key == "host_process_visible":
+        original_stat = os.stat
+
+        def failing_stat(path, *args, **kwargs):
+            if str(path) == "/proc/self/ns/pid":
+                raise OSError("fixture inaccessible proc")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr("os.stat", failing_stat)
+    elif probe_key == "nvidia_visible":
+        monkeypatch.setattr(
+            Path,
+            "iterdir",
+            lambda self: (_ for _ in ()).throw(OSError("fixture inaccessible dev")),
+        )
+    elif probe_key in {"docker_socket_visible", "other_worktree_visible"}:
+        original_stat = Path.stat
+        fault_paths = {
+            "docker_socket_visible": {
+                "/var/run/docker.sock",
+                "/run/docker.sock",
+                "/run/containerd/containerd.sock",
+            },
+            "other_worktree_visible": {
+                "/.worktrees",
+                "/repo/.worktrees",
+                "/worktrees",
+                "/workspace/../.worktrees",
+            },
+        }[probe_key]
+
+        def failing_stat(path: Path, *args, **kwargs):
+            if str(path) in fault_paths:
+                raise OSError(f"fixture inaccessible {probe_key}")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", failing_stat)
+    elif probe_key == "genesis_importable":
+        monkeypatch.setattr(
+            "importlib.util.find_spec",
+            lambda name: (_ for _ in ()).throw(OSError("fixture inaccessible import path")),
+        )
+    else:
+        original_stat = Path.stat
+
+        def failing_executable_stat(path: Path, *args, **kwargs):
+            if path.name == "dora":
+                raise OSError("fixture inaccessible executable path")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", failing_executable_stat)
+
+    result = _execute_native_sandbox_probe(source)
+    ok, errors = verify_sandbox_probe(result)
+
+    assert result[probe_key] is None
+    assert ok is False
+    assert any(probe_key in error for error in errors)
+
+
+def test_native_sandbox_negative_probes_distinguish_successful_absence(monkeypatch):
+    """Native isolation design: a completed absence inspection remains the exact false boolean."""
+    from aisle.harness.native_sandbox import sandbox_probe_command
+
+    host_namespace = os.stat("/proc/self/ns/pid").st_ino
+    source = sandbox_probe_command()[3].replace(
+        f"HOST_PID_NAMESPACE = {host_namespace}",
+        f"HOST_PID_NAMESPACE = {host_namespace + 1}",
+    )
+    monkeypatch.setattr("socket.getaddrinfo", lambda *args, **kwargs: [])
+    monkeypatch.setattr(Path, "iterdir", lambda self: iter(()))
+    monkeypatch.setattr(
+        Path,
+        "stat",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+
+    result = _execute_native_sandbox_probe(source)
+
+    assert {
+        key: result[key]
+        for key in (
+            "host_process_visible",
+            "nvidia_visible",
+            "docker_socket_visible",
+            "genesis_importable",
+            "dora_executable",
+            "other_worktree_visible",
+        )
+    } == {
+        "host_process_visible": False,
+        "nvidia_visible": False,
+        "docker_socket_visible": False,
+        "genesis_importable": False,
+        "dora_executable": False,
+        "other_worktree_visible": False,
+    }
