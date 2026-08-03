@@ -243,14 +243,16 @@ def run_script_rollout(
     """
     if not _RUN_ID.fullmatch(run_id):
         raise ValueError(f"unsafe run_id {run_id!r}")
+    root = (root or _repository_root()).resolve()
     policy = policy.resolve()
+    if not policy.is_relative_to(root):
+        raise ValueError("policy is outside the trusted session root")
     if not policy.is_file():
         raise ValueError(f"policy file does not exist: {policy}")
     seed_values = parse_seed_range(seeds)
     if not seed_values:
         raise ValueError("at least one seed is required")
 
-    root = (root or _repository_root()).resolve()
     run_dir = root / "runs" / run_id
     if run_dir.exists():
         raise ValueError(f"run_id {run_id!r} already exists; refusing to overwrite")

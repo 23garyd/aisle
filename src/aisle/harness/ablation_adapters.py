@@ -198,16 +198,23 @@ class AisleAdapter:
         self._preflights: dict[Path, tuple[str, PreflightResult]] = {}
 
     def _candidate(self, candidate: Path) -> Path:
-        return candidate.resolve()
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(self._root):
+            raise ValueError("candidate is outside the trusted root")
+        return resolved
 
     def preflight(self, candidate: Path) -> PreflightResult:
         started = time.monotonic()
+        try:
+            candidate_path = self._candidate(candidate)
+        except (OSError, ValueError):
+            return _preflight_failure("INFRA_ARGUMENT", started)
         response, code = _command_response(
             self._runner,
             [
                 "harness",
                 "validate",
-                str(self._candidate(candidate)),
+                str(candidate_path),
                 "--root",
                 str(self._root),
                 "--embodiment",
@@ -220,8 +227,8 @@ class AisleAdapter:
             assert response is not None
             result = _normal_preflight(response, started)
         try:
-            self._preflights[self._candidate(candidate)] = (
-                sha256_file(self._candidate(candidate)),
+            self._preflights[candidate_path] = (
+                sha256_file(candidate_path),
                 result,
             )
         except OSError:
@@ -231,6 +238,19 @@ class AisleAdapter:
     def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
         started = time.monotonic()
         candidate_path, candidate_hash, candidate_identity = _resolved_candidate_hash(candidate)
+        if candidate_path is not None and not candidate_path.is_relative_to(self._root):
+            preflight = PreflightResult(
+                ok=False,
+                errors=({"code": "INFRA_ARGUMENT"},),
+                wall_s=0.0,
+            )
+            return _attempt_failure(
+                run_id,
+                candidate_hash,
+                preflight,
+                "INFRA_ARGUMENT",
+                started,
+            )
         if candidate_identity is not None:
             preflight = PreflightResult(ok=False, errors=({"code": "INFRA_ARGUMENT"},), wall_s=0.0)
             return _attempt_failure(
@@ -306,6 +326,7 @@ class ScriptAdapter:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         trusted_root = root.resolve() if root is not None else None
+        self._root = trusted_root
         self._preflight_runner = preflight_runner or (
             preflight_script
             if trusted_root is None
@@ -323,11 +344,21 @@ class ScriptAdapter:
         self._preflights: dict[Path, tuple[str, PreflightResult]] = {}
 
     def _candidate(self, candidate: Path) -> Path:
-        return candidate.resolve()
+        resolved = candidate.resolve()
+        if self._root is not None and not resolved.is_relative_to(self._root):
+            raise ValueError("candidate is outside the trusted root")
+        return resolved
 
     def preflight(self, candidate: Path) -> PreflightResult:
-        candidate_path = self._candidate(candidate)
         started = self._clock()
+        try:
+            candidate_path = self._candidate(candidate)
+        except (OSError, ValueError):
+            return PreflightResult(
+                ok=False,
+                errors=({"code": "INFRA_ARGUMENT"},),
+                wall_s=self._clock() - started,
+            )
         try:
             result = self._preflight_runner(candidate_path)
         except subprocess.TimeoutExpired:
@@ -351,6 +382,23 @@ class ScriptAdapter:
     def rollout(self, candidate: Path, seeds: str, run_id: str) -> AttemptResult:
         started = time.monotonic()
         candidate_path, candidate_hash, candidate_identity = _resolved_candidate_hash(candidate)
+        if (
+            candidate_path is not None
+            and self._root is not None
+            and not candidate_path.is_relative_to(self._root)
+        ):
+            preflight = PreflightResult(
+                ok=False,
+                errors=({"code": "INFRA_ARGUMENT"},),
+                wall_s=0.0,
+            )
+            return _attempt_failure(
+                run_id,
+                candidate_hash,
+                preflight,
+                "INFRA_ARGUMENT",
+                started,
+            )
         if candidate_identity is not None:
             preflight = PreflightResult(ok=False, errors=({"code": "INFRA_ARGUMENT"},), wall_s=0.0)
             return _attempt_failure(

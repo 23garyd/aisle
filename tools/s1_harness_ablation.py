@@ -13,13 +13,16 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import hmac
 import json
 import math
 import os
 import queue
 import secrets
+import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -37,8 +40,16 @@ if str(TOOLS_DIR) not in sys.path:
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from build_s1_agent_env import (  # noqa: E402
+    AgentEnvironmentSpec,
+    inspect_agent_environment,
+)
 from campaign import UsageCounter, agent_cmd_campaign, audit_frozen  # noqa: E402
 
+from aisle.harness import ablation_adapters as ablation_adapters_module  # noqa: E402
+from aisle.harness import native_sandbox  # noqa: E402
+from aisle.harness import rollout as rollout_module  # noqa: E402
+from aisle.harness import script_rollout as script_rollout_module  # noqa: E402
 from aisle.harness.ablation import (  # noqa: E402
     AttemptResult,
     append_ledger,
@@ -47,6 +58,7 @@ from aisle.harness.ablation import (  # noqa: E402
     verify_ledger,
 )
 from aisle.harness.ablation_adapters import AisleAdapter, ScriptAdapter  # noqa: E402
+from aisle.harness.native_sandbox import SandboxPolicy  # noqa: E402
 from aisle.harness.rollout import (  # noqa: E402
     budget_ledger,
     load_campaign_budget,
@@ -81,8 +93,12 @@ ARTIFACT_NAMES = (
     "holdout.json",
     "audit.json",
 )
+ATTEMPT_CLIENT = TOOLS_DIR / "s1_harness_attempt_client.py"
 CONTROLLER_RESERVATION = "__s1_ablation_controller_reserve__"
 GLOBAL_SIMULATOR_LOCK = Path("/tmp/aisle-s1-harness-ablation-simulator.lock")
+_ATTEMPT_PROTOCOL = 1
+_MAX_BROKER_MESSAGE_BYTES = 1024 * 1024
+_PROBE_TIMEOUT_S = 30.0
 
 _GOAL = (
     "Improve the supplied incomplete S1 store-order-pick starter so the robot "
@@ -129,6 +145,7 @@ class ExecutionResult:
     returncode: int
     wall_s: float
     agent_version: str
+    process_group_clean: bool = True
 
 
 def _resolve_pin(repo: Path, pin: str) -> str:
@@ -192,6 +209,56 @@ def default_adapter_factory(condition: str, worktree: Path):
     return ScriptAdapter(root=worktree)
 
 
+def _controller_project_root() -> Path:
+    if REPO_ROOT.parent.name == ".worktrees":
+        return REPO_ROOT.parent.parent
+    return REPO_ROOT
+
+
+def _default_agent_environment(agent: str) -> Path:
+    del agent
+    return _controller_project_root() / ".s1-agent-environments" / "s1"
+
+
+def _default_agent_executable(agent: str) -> Path:
+    executable = shutil.which(agent)
+    if executable is None:
+        raise ControllerError("AGENT_EXECUTABLE", f"cannot resolve {agent} executable")
+    return Path(executable)
+
+
+def _default_execute_sandbox_probe(
+    command: list[str],
+    cwd: Path,
+    environment: dict[str, str],
+    timeout: float,
+) -> dict:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ControllerError("SANDBOX_PROBE", "sandbox probe could not complete") from exc
+    try:
+        decoder = json.JSONDecoder()
+        result, end = decoder.raw_decode(completed.stdout.lstrip())
+    except json.JSONDecodeError as exc:
+        raise ControllerError("SANDBOX_PROBE", "sandbox probe output is not JSON") from exc
+    if (
+        completed.stdout.lstrip()[end:].strip()
+        or completed.returncode != 0
+        or not isinstance(result, dict)
+    ):
+        raise ControllerError("SANDBOX_PROBE", "sandbox probe response is invalid")
+    return result
+
+
 @dataclass(frozen=True)
 class ControllerRuntime:
     """Narrow external boundaries; tests replace them with zero-cost fixtures."""
@@ -204,70 +271,427 @@ class ControllerRuntime:
     worktree_head: Callable[[Path], str | None] = _worktree_head
     worktree_status: Callable[[Path], list[str] | None] = _worktree_status
     epoch_time: Callable[[], float] = time.time
+    worktrees_root: Path | None = None
+    agent_environment: Callable[[str], Path] = _default_agent_environment
+    inspect_agent_environment: Callable[[Path], AgentEnvironmentSpec] = inspect_agent_environment
+    agent_executable: Callable[[str], Path] = _default_agent_executable
+    bwrap_executable: Callable[[], Path] = lambda: native_sandbox.BWRAP
+    build_bwrap_argv: Callable[[SandboxPolicy, list[str], dict[str, str]], list[str]] = (
+        native_sandbox.build_bwrap_argv
+    )
+    sandbox_probe_command: Callable[[], list[str]] = native_sandbox.sandbox_probe_command
+    execute_sandbox_probe: Callable[[list[str], Path, dict[str, str], float], dict] = (
+        _default_execute_sandbox_probe
+    )
+
+
+@dataclass(frozen=True)
+class BrokerEndpoint:
+    """Controller-owned files and identity evidence for one broker instance."""
+
+    runtime_dir: Path
+    socket_path: Path
+    credential_path: Path
+    broker_id: str
+    socket_inode: int
+    socket_ctime_ns: int
+    socket_identity_sha256: str
+    credential_sha256: str
+    started_at_epoch: float
+    expires_at_epoch: float
+
+
+@dataclass(frozen=True)
+class AuthorizedAttempt:
+    """A request whose identity, candidate bytes, nonce, and seeds were rechecked."""
+
+    session_id: str
+    condition: str
+    nonce: int
+    candidate: Path
+    candidate_relpath: str
+    candidate_sha256: str
+    seeds: tuple[int, ...]
+    seed_domain: str
+    request_sha256: str
+
+
+def _private_runtime_directory(path: Path, worktree: Path) -> Path:
+    requested = path.expanduser()
+    if requested.is_symlink():
+        raise ControllerError("ATTEMPT_BROKER_START", "broker runtime cannot be a symlink")
+    try:
+        requested.mkdir(mode=0o700, parents=False, exist_ok=False)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise ControllerError("ATTEMPT_BROKER_START", "cannot create broker runtime") from exc
+    try:
+        resolved = requested.resolve(strict=True)
+        info = requested.lstat()
+    except OSError as exc:
+        raise ControllerError("ATTEMPT_BROKER_START", "cannot inspect broker runtime") from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or resolved.is_relative_to(worktree)
+        or worktree.is_relative_to(resolved)
+    ):
+        raise ControllerError(
+            "ATTEMPT_BROKER_START",
+            "broker runtime must be private, controller-owned, and outside the worktree",
+        )
+    return resolved
+
+
+def _candidate_relative(record: dict, worktree: Path) -> str:
+    candidate = Path(str(record.get("candidate", "")))
+    if not candidate.is_absolute():
+        candidate = Path(str(record.get("worktree", ""))) / candidate
+        if not candidate.is_absolute():
+            candidate = worktree.parent / candidate
+    try:
+        return candidate.resolve(strict=False).relative_to(worktree).as_posix()
+    except (OSError, ValueError) as exc:
+        raise ControllerError(
+            "ARTIFACT_INVALID", "assigned candidate is outside its worktree"
+        ) from exc
 
 
 class AttemptBroker:
-    """Authenticated controller-owned IPC for in-session adapter launches."""
+    """Authenticated controller-owned IPC for in-session trusted launches."""
 
-    def __init__(self, session_dir: Path, runtime: ControllerRuntime) -> None:
+    _REQUEST_KEYS = frozenset(
+        {
+            "protocol",
+            "session_id",
+            "condition",
+            "nonce",
+            "credential",
+            "candidate_relpath",
+            "candidate_sha256",
+            "seeds",
+        }
+    )
+
+    def __init__(
+        self,
+        session_dir: Path,
+        runtime: ControllerRuntime,
+        *,
+        runtime_dir: Path | None = None,
+        controller_hashes: dict[str, str] | None = None,
+        expires_at_epoch: float | None = None,
+    ) -> None:
         self.session_dir = session_dir.resolve()
         self.runtime = runtime
-        self.capability = secrets.token_hex(32)
-        nonce = secrets.token_hex(8)
-        self.socket_path = Path("/tmp") / f"aisle-s1-attempt-{nonce}.sock"
+        record = _load_json(self.session_dir / "session.json")
+        self.session_id = str(record.get("session_id"))
+        self.condition = str(record.get("condition"))
+        self.worktree = Path(str(record.get("worktree", ""))).resolve()
+        self.candidate_relpath = _candidate_relative(record, self.worktree)
+        self.runtime_dir = (
+            runtime_dir or Path("/tmp") / f"aisle-s1-{secrets.token_hex(8)}"
+        ).resolve(strict=False)
+        self.controller_hashes = dict(
+            controller_hashes
+            or (record.get("isolation") if isinstance(record.get("isolation"), dict) else {})
+        )
+        if not self.controller_hashes:
+            self.controller_hashes = {"runner_sha256": sha256_file(Path(__file__))}
+        if not all(
+            isinstance(key, str) and isinstance(value, str) and len(value) == 64
+            for key, value in self.controller_hashes.items()
+        ):
+            raise ControllerError("ATTEMPT_BROKER_START", "controller hash binding is invalid")
+        self.started_at_epoch = float(runtime.epoch_time())
+        requested_expiry = (
+            self.started_at_epoch + MAX_WALL_HOURS * 3600.0
+            if expires_at_epoch is None
+            else float(expires_at_epoch)
+        )
+        if (
+            not math.isfinite(self.started_at_epoch)
+            or not math.isfinite(requested_expiry)
+            or requested_expiry <= self.started_at_epoch
+            or requested_expiry - self.started_at_epoch > MAX_WALL_HOURS * 3600.0
+        ):
+            raise ControllerError("ATTEMPT_BROKER_START", "credential expiry is invalid")
+        self.expires_at_epoch = requested_expiry
+        self.broker_id = secrets.token_hex(16)
+        self.__root_capability = secrets.token_bytes(32)
+        self._credential: str | None = None
+        self._endpoint: BrokerEndpoint | None = None
+        self._last_nonce = 0
         self._server: socket.socket | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._fatal_reason: str | None = None
 
     @property
-    def capability_sha256(self) -> str:
-        return _sha256_text(self.capability)
+    def endpoint(self) -> BrokerEndpoint:
+        if self._endpoint is None:
+            raise ControllerError("ATTEMPT_BROKER_START", "broker has not started")
+        return self._endpoint
+
+    @property
+    def fatal_reason(self) -> str | None:
+        return self._fatal_reason
+
+    @property
+    def credential_sha256(self) -> str:
+        return self.endpoint.credential_sha256
 
     def environment(self) -> dict[str, str]:
+        """No host path or credential is inherited by the sandboxed process."""
+
+        return {}
+
+    def _credential_binding(
+        self,
+        *,
+        socket_inode: int,
+        socket_ctime_ns: int,
+        socket_identity_sha256: str,
+    ) -> dict:
         return {
-            "AISLE_ABLATION_SESSION": str(self.session_dir),
-            "AISLE_ABLATION_CONTROLLER": str(Path(__file__).resolve()),
-            "AISLE_ABLATION_SOCKET": str(self.socket_path),
-            "AISLE_ABLATION_CAPABILITY": self.capability,
+            "protocol": _ATTEMPT_PROTOCOL,
+            "broker_id": self.broker_id,
+            "session_id": self.session_id,
+            "condition": self.condition,
+            "socket_inode": socket_inode,
+            "socket_ctime_ns": socket_ctime_ns,
+            "socket_identity_sha256": socket_identity_sha256,
+            "controller_hashes": self.controller_hashes,
+            "started_at_epoch": self.started_at_epoch,
+            "expires_at_epoch": self.expires_at_epoch,
         }
 
-    def __enter__(self) -> AttemptBroker:
+    def start(self) -> BrokerEndpoint:
+        if self._endpoint is not None:
+            return self._endpoint
+        runtime_dir = _private_runtime_directory(self.runtime_dir, self.worktree)
+        socket_path = runtime_dir / "attempt.sock"
+        credential_path = runtime_dir / "credential.json"
+        if socket_path.exists() or credential_path.exists():
+            raise ControllerError("ATTEMPT_BROKER_START", "broker runtime is not fresh")
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(self.socket_path))
-        os.chmod(self.socket_path, 0o600)
-        server.listen(1)
-        server.settimeout(0.1)
+        try:
+            server.bind(str(socket_path))
+            os.chmod(socket_path, 0o600)
+            socket_stat = socket_path.lstat()
+            if not stat.S_ISSOCK(socket_stat.st_mode):
+                raise ControllerError("ATTEMPT_BROKER_START", "broker socket is invalid")
+            socket_identity = {
+                "inode": socket_stat.st_ino,
+                "ctime_ns": socket_stat.st_ctime_ns,
+                "mode": stat.S_IMODE(socket_stat.st_mode),
+            }
+            socket_identity_sha256 = _sha256_text(_canonical_json(socket_identity))
+            binding = self._credential_binding(
+                socket_inode=socket_stat.st_ino,
+                socket_ctime_ns=socket_stat.st_ctime_ns,
+                socket_identity_sha256=socket_identity_sha256,
+            )
+            credential = hmac.new(
+                self.__root_capability,
+                _canonical_json(binding).encode(),
+                hashlib.sha256,
+            ).hexdigest()
+            config = {
+                "protocol": _ATTEMPT_PROTOCOL,
+                "session_id": self.session_id,
+                "condition": self.condition,
+                "credential": credential,
+                "candidate_relpath": self.candidate_relpath,
+                "expires_at_epoch": self.expires_at_epoch,
+            }
+            _write_json(credential_path, config)
+            os.chmod(credential_path, 0o600)
+            server.listen(1)
+            server.settimeout(0.1)
+        except Exception:
+            server.close()
+            socket_path.unlink(missing_ok=True)
+            credential_path.unlink(missing_ok=True)
+            raise
+        self._credential = credential
         self._server = server
-        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._endpoint = BrokerEndpoint(
+            runtime_dir=runtime_dir,
+            socket_path=socket_path,
+            credential_path=credential_path,
+            broker_id=self.broker_id,
+            socket_inode=socket_stat.st_ino,
+            socket_ctime_ns=socket_stat.st_ctime_ns,
+            socket_identity_sha256=socket_identity_sha256,
+            credential_sha256=_sha256_text(credential),
+            started_at_epoch=self.started_at_epoch,
+            expires_at_epoch=self.expires_at_epoch,
+        )
+        self._thread = threading.Thread(
+            target=self._serve,
+            name=f"aisle-attempt-broker-{self.session_id}",
+            daemon=True,
+        )
         self._thread.start()
+        return self._endpoint
+
+    def __enter__(self) -> AttemptBroker:
+        self.start()
         return self
 
-    def _response(self, request: object) -> dict:
+    def _socket_identity_valid(self) -> bool:
+        try:
+            info = self.endpoint.socket_path.lstat()
+        except OSError:
+            return False
+        identity = {
+            "inode": info.st_ino,
+            "ctime_ns": info.st_ctime_ns,
+            "mode": stat.S_IMODE(info.st_mode),
+        }
+        return (
+            stat.S_ISSOCK(info.st_mode)
+            and info.st_ino == self.endpoint.socket_inode
+            and info.st_ctime_ns == self.endpoint.socket_ctime_ns
+            and hmac.compare_digest(
+                _sha256_text(_canonical_json(identity)),
+                self.endpoint.socket_identity_sha256,
+            )
+        )
+
+    def _authorize_unlocked(self, request: dict) -> AuthorizedAttempt:
+        if not isinstance(request, dict) or set(request) != self._REQUEST_KEYS:
+            raise ControllerError(
+                "ATTEMPT_BROKER_AUTH",
+                "attempt request was not authorized for this session",
+            )
+        nonce = request.get("nonce")
+        if isinstance(nonce, bool) or not isinstance(nonce, int) or nonce <= self._last_nonce:
+            raise ControllerError(
+                "ATTEMPT_BROKER_REPLAY", "attempt nonce is not strictly increasing"
+            )
         if (
-            not isinstance(request, dict)
-            or set(request) != {"capability", "session", "seeds"}
-            or request.get("capability") != self.capability
-            or Path(str(request.get("session"))).resolve() != self.session_dir
-            or not isinstance(request.get("seeds"), str)
+            request.get("protocol") != _ATTEMPT_PROTOCOL
+            or isinstance(request.get("protocol"), bool)
+            or request.get("session_id") != self.session_id
+            or request.get("condition") != self.condition
+            or not isinstance(request.get("credential"), str)
+            or self._credential is None
+            or not hmac.compare_digest(request["credential"], self._credential)
+            or not self._socket_identity_valid()
         ):
+            raise ControllerError(
+                "ATTEMPT_BROKER_AUTH",
+                "attempt request was not authorized for this session",
+            )
+        now = float(self.runtime.epoch_time())
+        if not math.isfinite(now) or now < self.started_at_epoch or now >= self.expires_at_epoch:
+            raise ControllerError("ATTEMPT_BROKER_EXPIRED", "attempt credential expired")
+        relative = request.get("candidate_relpath")
+        if not isinstance(relative, str) or relative != self.candidate_relpath:
+            raise ControllerError(
+                "CANDIDATE_PATH", "candidate path is not assigned to this session"
+            )
+        try:
+            candidate = (self.worktree / relative).resolve(strict=True)
+        except OSError as exc:
+            raise ControllerError("CANDIDATE_MISSING", "assigned candidate is missing") from exc
+        if not candidate.is_relative_to(self.worktree) or not candidate.is_file():
+            raise ControllerError("CANDIDATE_PATH", "candidate escaped the assigned worktree")
+        supplied_hash = request.get("candidate_sha256")
+        candidate_hash = sha256_file(candidate)
+        if (
+            not isinstance(supplied_hash, str)
+            or len(supplied_hash) != 64
+            or not hmac.compare_digest(candidate_hash, supplied_hash)
+        ):
+            raise ControllerError("CANDIDATE_HASH", "candidate bytes changed before admission")
+        seeds = _parse_attempt_seed_csv(request.get("seeds"))
+        development = set(_parse_seeds(DEVELOPMENT_SEEDS))
+        if not set(seeds) <= development:
+            raise ControllerError(
+                "SEED_DOMAIN", "attempt seeds must stay in the development domain"
+            )
+        self._last_nonce = nonce
+        return AuthorizedAttempt(
+            session_id=self.session_id,
+            condition=self.condition,
+            nonce=nonce,
+            candidate=candidate,
+            candidate_relpath=relative,
+            candidate_sha256=candidate_hash,
+            seeds=seeds,
+            seed_domain=(
+                "regression" if set(seeds) <= set(_parse_seeds(REGRESSION_SEEDS)) else "development"
+            ),
+            request_sha256=_sha256_text(_canonical_json(request)),
+        )
+
+    def authorize(self, request: dict) -> AuthorizedAttempt:
+        self.start()
+        lock_path = self.session_dir / "attempt.lock"
+        with lock_path.open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                return self._authorize_unlocked(request)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _response(self, request: object) -> dict:
+        if not isinstance(request, dict):
             return {
                 "ok": False,
-                "code": "ATTEMPT_BROKER_AUTH",
-                "error": "attempt request was not authorized for this session",
+                "code": "ATTEMPT_BROKER_PROTOCOL",
+                "error": "attempt request must be one JSON object",
             }
+        lock_path = self.session_dir / "attempt.lock"
         try:
-            return _attempt(
-                argparse.Namespace(
-                    session=str(self.session_dir),
-                    seeds=request["seeds"],
-                ),
-                self.runtime,
-            )
+            with lock_path.open("a+", encoding="utf-8") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                try:
+                    authorized = self._authorize_unlocked(request)
+                    return _execute_authorized_attempt(
+                        self.session_dir,
+                        authorized,
+                        self.runtime,
+                        credential_sha256=self.credential_sha256,
+                    )
+                finally:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         except ControllerError as exc:
+            if exc.code in {
+                "ATTEMPT_BROKER_AUTH",
+                "ATTEMPT_BROKER_EXPIRED",
+                "ATTEMPT_BROKER_PROTOCOL",
+                "ATTEMPT_BROKER_REPLAY",
+                "CANDIDATE_HASH",
+                "CANDIDATE_PATH",
+                "SEED_DOMAIN",
+            }:
+                self._fatal_reason = "broker_policy"
             return {"ok": False, "code": exc.code, "error": exc.detail}
-        except Exception as exc:  # noqa: BLE001 - preserve the broker response contract
+        except Exception as exc:  # noqa: BLE001 - normalize the trusted server boundary
+            self._fatal_reason = "broker_failure"
             print(f"[s1-ablation] attempt broker error: {exc!r}", file=sys.stderr)
-            return {"ok": False, "code": "INTERNAL", "error": str(exc)}
+            return {
+                "ok": False,
+                "code": "ATTEMPT_BROKER_FAILURE",
+                "error": "trusted attempt execution failed",
+            }
+
+    @staticmethod
+    def _decode_request(encoded: bytes) -> dict:
+        if len(encoded) > _MAX_BROKER_MESSAGE_BYTES:
+            raise ValueError("request too large")
+        text = encoded.decode("utf-8")
+        decoder = json.JSONDecoder()
+        request, end = decoder.raw_decode(text.lstrip())
+        if text.lstrip()[end:].strip() or not isinstance(request, dict):
+            raise ValueError("request is not one object")
+        return request
 
     def _serve(self) -> None:
         assert self._server is not None
@@ -279,30 +703,50 @@ class AttemptBroker:
             except OSError:
                 break
             with connection:
+                received = bytearray()
                 try:
-                    stream = connection.makefile("r", encoding="utf-8")
-                    line = stream.readline(1024 * 1024)
-                    request = json.loads(line)
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    while True:
+                        chunk = connection.recv(
+                            min(
+                                65536,
+                                _MAX_BROKER_MESSAGE_BYTES + 1 - len(received),
+                            )
+                        )
+                        if not chunk:
+                            break
+                        received.extend(chunk)
+                        if len(received) > _MAX_BROKER_MESSAGE_BYTES:
+                            raise ValueError("request too large")
+                    request = self._decode_request(bytes(received))
+                    response = self._response(request)
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    self._fatal_reason = "broker_policy"
                     response = {
                         "ok": False,
                         "code": "ATTEMPT_BROKER_PROTOCOL",
-                        "error": "attempt request must be one JSON object",
+                        "error": "attempt request must be one bounded JSON object",
                     }
-                else:
-                    response = self._response(request)
                 try:
                     connection.sendall((_canonical_json(response) + "\n").encode())
                 except OSError:
                     pass
 
-    def __exit__(self, *exc: object) -> None:
+    def stop(self) -> bool:
         self._stop.set()
         if self._server is not None:
             self._server.close()
         if self._thread is not None:
-            self._thread.join(timeout=1)
-        self.socket_path.unlink(missing_ok=True)
+            self._thread.join(timeout=5)
+        clean = self._thread is None or not self._thread.is_alive()
+        if self._endpoint is not None:
+            self._endpoint.socket_path.unlink(missing_ok=True)
+            self._endpoint.credential_path.unlink(missing_ok=True)
+        self._credential = None
+        self.__root_capability = b""
+        return clean
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
 
 
 def _canonical_json(value: object) -> str:
@@ -320,8 +764,19 @@ def _sha256_text(value: str) -> str:
 def _write_json(path: Path, value: object) -> None:
     encoded = json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n"
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(encoded, encoding="utf-8")
+    with temporary.open("w", encoding="utf-8") as stream:
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
     os.replace(temporary, path)
+    try:
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _append_jsonl(path: Path, value: object) -> None:
@@ -357,6 +812,18 @@ def _parse_seeds(spec: str) -> tuple[int, ...]:
     return values
 
 
+def _parse_attempt_seed_csv(spec: object) -> tuple[int, ...]:
+    if not isinstance(spec, str) or not spec:
+        raise ControllerError("SEED_DOMAIN", "attempt seeds must be a non-empty CSV")
+    pieces = spec.split(",")
+    if any(not piece.isascii() or not piece.isdecimal() for piece in pieces):
+        raise ControllerError("SEED_DOMAIN", "attempt seeds must be decimal CSV values")
+    values = tuple(int(piece) for piece in pieces)
+    if len(set(values)) != len(values):
+        raise ControllerError("SEED_DOMAIN", "attempt seeds must be unique")
+    return values
+
+
 def _seed_hashes() -> dict[str, str]:
     return {
         "development": _sha256_text(DEVELOPMENT_SEEDS),
@@ -377,8 +844,12 @@ def _seed_hashes() -> dict[str, str]:
 def _session_prompt(session: dict, budgets: dict[str, int | float] | None = None) -> str:
     selected = budgets or session["budget_ceiling"]
     candidate = Path(session["candidate"])
-    if candidate.parts and candidate.parts[0] == session.get("worktree"):
-        candidate = Path(*candidate.parts[1:])
+    worktree = Path(session["worktree"])
+    try:
+        candidate = candidate.relative_to(worktree)
+    except ValueError:
+        if candidate.parts and candidate.parts[0] == worktree.name:
+            candidate = Path(*candidate.parts[1:])
     return (
         f"{_GOAL}\n\n"
         f"Assigned condition: {session['condition']}.\n"
@@ -392,8 +863,7 @@ def _session_prompt(session: dict, budgets: dict[str, int | float] | None = None
         f"{float(selected['wall_h']):g} wall hours. The controller is the sole "
         "authority for all three ceilings.\n"
         "Run every development or regression attempt only through:\n"
-        'python "$AISLE_ABLATION_CONTROLLER" attempt '
-        '--session "$AISLE_ABLATION_SESSION" --seeds <dev-seeds>\n'
+        "python /opt/aisle/attempt-client --seeds <csv>\n"
         "Never invoke harness rollout, dora, Genesis, or the simulator directly.\n"
         "Do not access other sessions, accept operator hints, run a simulator outside "
         "the protected adapter, or change the assigned condition."
@@ -425,14 +895,40 @@ def _prepare(args: argparse.Namespace, runtime: ControllerRuntime, repo_root: Pa
     assignments = paired_assignments(args.assignment_seed, args.pairs)
     runner_hash = sha256_file(Path(__file__))
     sessions: list[str] = []
+    configured_root = (
+        runtime.worktrees_root
+        if runtime.worktrees_root is not None
+        else (
+            repo_root.parent if repo_root.parent.name == ".worktrees" else repo_root / ".worktrees"
+        )
+    )
+    configured_root = configured_root.expanduser().resolve(strict=False)
+    try:
+        configured_root.mkdir(mode=0o700, parents=False, exist_ok=True)
+    except OSError as exc:
+        raise ControllerError(
+            "WORKTREE_ROOT",
+            "configured session worktree root is unavailable",
+        ) from exc
+    if not configured_root.is_dir():
+        raise ControllerError("WORKTREE_ROOT", "configured session worktree root is invalid")
 
     for index, condition in enumerate(assignments, start=1):
         session_id = f"S{index:04d}"
         sessions.append(session_id)
         session_dir = out / session_id
-        worktree = session_dir / "worktree"
+        worktree_tag = _sha256_text(f"{out}:{session_id}")[:16]
+        worktree = configured_root / f"s1-{worktree_tag}-{session_id}"
         session_dir.mkdir()
+        if worktree.exists():
+            raise ControllerError("WORKTREE_CREATE", f"session worktree already exists: {worktree}")
         runtime.create_worktree(pin, worktree)
+        worktree = worktree.resolve(strict=True)
+        if worktree.parent != configured_root:
+            raise ControllerError(
+                "WORKTREE_CREATE",
+                "prepared session worktree escaped the configured direct-child root",
+            )
         starter = STARTERS[condition]
         starter_path = worktree / starter
         if not starter_path.is_file():
@@ -451,9 +947,12 @@ def _prepare(args: argparse.Namespace, runtime: ControllerRuntime, repo_root: Pa
             "condition": condition,
             "state": "prepared",
             "pin": pin,
-            "worktree": "worktree",
+            "worktrees_root": str(configured_root),
+            "worktrees_root_sha256": _sha256_text(str(configured_root)),
+            "worktree": str(worktree),
+            "worktree_path_sha256": _sha256_text(str(worktree)),
             "starter": starter.as_posix(),
-            "candidate": (Path("worktree") / candidate).as_posix(),
+            "candidate": str(candidate_path.resolve()),
             "budget_ceiling": {
                 "tokens": MAX_NEW_TOKENS,
                 "episodes": MAX_DEVELOPMENT_EPISODES,
@@ -474,6 +973,8 @@ def _prepare(args: argparse.Namespace, runtime: ControllerRuntime, repo_root: Pa
         (session_dir / "attempts.jsonl").write_text("", encoding="utf-8")
         (session_dir / "agent.jsonl").write_text("", encoding="utf-8")
         (session_dir / "token_samples.jsonl").write_text("", encoding="utf-8")
+        (session_dir / "attempt.lock").write_text("", encoding="utf-8")
+        (session_dir / "score.lock").write_text("", encoding="utf-8")
         _write_json(session_dir / "holdout.json", {"ok": False, "state": "pending"})
         _write_json(session_dir / "audit.json", {"ok": False, "state": "pending"})
 
@@ -621,10 +1122,7 @@ def _execute_agent(
     """Capture a live vendor stream while independently enforcing ceilings."""
     started = time.monotonic()
     environment = os.environ.copy()
-    worktree_pythonpath = f"{cwd / 'src'}:{cwd}"
-    if environment.get("PYTHONPATH"):
-        worktree_pythonpath += f":{environment['PYTHONPATH']}"
-    environment["PYTHONPATH"] = worktree_pythonpath
+    environment.pop("PYTHONPATH", None)
     environment.update(session_environment)
     try:
         process = subprocess.Popen(
@@ -671,6 +1169,9 @@ def _execute_agent(
                 stream_done = True
             continue
         if line is None:
+            if process.poll() is None:
+                stopped = "stdout_eof"
+                _kill_process_group(process)
             stream_done = True
             continue
         try:
@@ -754,6 +1255,54 @@ def _initialize_episode_authority(worktree: Path, episodes: int) -> str | None:
     return str(result["entry"])
 
 
+def _agent_environment_sha256(spec: AgentEnvironmentSpec) -> str:
+    return _sha256_text(
+        _canonical_json(
+            {
+                "python": spec.python,
+                "lock_sha256": spec.lock_sha256,
+                "distributions": list(spec.distributions),
+                "executables": list(spec.executables),
+            }
+        )
+    )
+
+
+def _trusted_run_components(
+    record: dict,
+    runtime: ControllerRuntime,
+    worktree: Path,
+    agent: str,
+) -> tuple[dict[str, str], Path, Path, Path]:
+    agent_env = runtime.agent_environment(agent).expanduser().resolve(strict=True)
+    agent_spec = runtime.inspect_agent_environment(agent_env)
+    agent_executable = runtime.agent_executable(agent).expanduser().resolve(strict=True)
+    bwrap = runtime.bwrap_executable().expanduser().resolve(strict=True)
+    if not agent_env.is_dir() or not agent_executable.is_file() or not bwrap.is_file():
+        raise ControllerError("SANDBOX_COMPONENT", "sandbox launch component is unavailable")
+    runner_module = rollout_module if record.get("condition") == "aisle" else script_rollout_module
+    runner_file = Path(str(runner_module.__file__)).resolve(strict=True)
+    adapter_file = Path(str(ablation_adapters_module.__file__)).resolve(strict=True)
+    policy_file = Path(str(native_sandbox.__file__)).resolve(strict=True)
+    starter = worktree / str(record.get("starter", ""))
+    frozen_identity = {
+        "pin": record.get("pin"),
+        "starter_sha256": sha256_file(starter),
+        "seed_sha256": record.get("provenance", {}).get("seed_sha256"),
+    }
+    hashes = {
+        "broker_sha256": sha256_file(Path(__file__)),
+        "client_sha256": sha256_file(ATTEMPT_CLIENT),
+        "sandbox_policy_sha256": sha256_file(policy_file),
+        "agent_environment_sha256": _agent_environment_sha256(agent_spec),
+        "bwrap_sha256": sha256_file(bwrap),
+        "adapter_sha256": sha256_file(adapter_file),
+        "runner_sha256": sha256_file(runner_file),
+        "frozen_source_sha256": _sha256_text(_canonical_json(frozen_identity)),
+    }
+    return hashes, agent_env, agent_executable, bwrap
+
+
 def _run(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
     session_dir = _session_dir(args.session)
     record = _load_json(session_dir / "session.json")
@@ -818,13 +1367,68 @@ def _run(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
         )
 
     def stop_reason(wall_s: float) -> str | None:
+        broker_reason = attempt_broker.fatal_reason
+        if broker_reason is not None:
+            return broker_reason
         if counter.total >= args.tokens:
             return "token_budget"
         if wall_s >= args.wall_h * 3600.0:
             return "wall_budget"
         return None
 
-    attempt_broker = AttemptBroker(session_dir, runtime)
+    component_hashes, agent_env, agent_executable, _ = _trusted_run_components(
+        record,
+        runtime,
+        worktree,
+        args.agent,
+    )
+    started_at_epoch = runtime.epoch_time()
+    attempt_broker = AttemptBroker(
+        session_dir,
+        runtime,
+        controller_hashes=component_hashes,
+        expires_at_epoch=started_at_epoch + args.wall_h * 3600.0,
+    )
+    endpoint = attempt_broker.start()
+    policy = SandboxPolicy(
+        worktree=worktree,
+        agent_env=agent_env,
+        runtime_dir=endpoint.runtime_dir,
+        attempt_client=ATTEMPT_CLIENT,
+        agent_executable=agent_executable,
+        credential_mounts=(),
+    )
+    probe_argv = runtime.build_bwrap_argv(policy, runtime.sandbox_probe_command(), {})
+    probe_result = runtime.execute_sandbox_probe(
+        probe_argv,
+        worktree,
+        os.environ.copy(),
+        _PROBE_TIMEOUT_S,
+    )
+    probe_ok, probe_errors = native_sandbox.verify_sandbox_probe(probe_result)
+    if not probe_ok:
+        attempt_broker.stop()
+        raise ControllerError(
+            "SANDBOX_PROBE",
+            f"sandbox probe did not match the required contract: {list(probe_errors)}",
+        )
+    vendor_command = agent_cmd_campaign(args.agent, args.model, prompt)
+    vendor_command[0] = "/opt/aisle/agent"
+    command = runtime.build_bwrap_argv(policy, vendor_command, os.environ.copy())
+    isolation = {
+        **component_hashes,
+        "broker_id": endpoint.broker_id,
+        "credential_sha256": endpoint.credential_sha256,
+        "socket_inode": endpoint.socket_inode,
+        "socket_ctime_ns": endpoint.socket_ctime_ns,
+        "socket_identity_sha256": endpoint.socket_identity_sha256,
+        "broker_started_at_epoch": endpoint.started_at_epoch,
+        "credential_expires_at_epoch": endpoint.expires_at_epoch,
+        "namespace_probe": probe_result,
+        "namespace_probe_sha256": _sha256_text(_canonical_json(probe_result)),
+        "probe_argv_sha256": _sha256_text(_canonical_json(probe_argv)),
+        "sandbox_argv_sha256": _sha256_text(_canonical_json(command)),
+    }
     record.update(
         {
             "state": "running",
@@ -832,29 +1436,31 @@ def _run(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
             "model": args.model,
             "budgets": budgets,
             "run_prompt_sha256": _sha256_text(prompt),
-            "started_at_epoch": runtime.epoch_time(),
+            "started_at_epoch": started_at_epoch,
             "episode_reservation_sha256": reservation_hash,
             "attempt_broker": {
-                "capability_sha256": attempt_broker.capability_sha256,
+                "credential_sha256": endpoint.credential_sha256,
+                "broker_id": endpoint.broker_id,
+                "socket_identity_sha256": endpoint.socket_identity_sha256,
                 "controller_sha256": sha256_file(Path(__file__)),
             },
+            "isolation": isolation,
         }
     )
     _write_json(session_dir / "session.json", record)
     executor = runtime.execute_agent or _execute_agent
-    command = agent_cmd_campaign(args.agent, args.model, prompt)
     try:
-        with _simulator_authority(), attempt_broker:
-            execution = executor(
-                command,
-                worktree,
-                args.agent,
-                on_line,
-                stop_reason,
-                args.wall_h * 3600.0,
-                attempt_broker.environment(),
-            )
+        execution = executor(
+            command,
+            worktree,
+            args.agent,
+            on_line,
+            stop_reason,
+            args.wall_h * 3600.0,
+            attempt_broker.environment(),
+        )
     except ControllerError:
+        broker_clean = attempt_broker.stop()
         record.update(
             {
                 "state": "agent_stopped",
@@ -862,10 +1468,26 @@ def _run(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
                 "stop_reason": "infrastructure",
                 "tokens_spent": None,
                 "telemetry": {"valid": False, "ledger_head": ledger_head},
+                "isolation_cleanup": {
+                    "broker_stopped": broker_clean,
+                    "credential_revoked": not endpoint.credential_path.exists(),
+                    "socket_removed": not endpoint.socket_path.exists(),
+                    "process_group_clean": False,
+                },
             }
         )
         _write_json(session_dir / "session.json", record)
         raise
+    broker_failure = attempt_broker.fatal_reason
+    broker_clean = attempt_broker.stop()
+    if broker_failure is not None and execution.stopped == "agent_done":
+        execution = ExecutionResult(
+            stopped=broker_failure,
+            returncode=execution.returncode,
+            wall_s=execution.wall_s,
+            agent_version=execution.agent_version,
+            process_group_clean=execution.process_group_clean,
+        )
 
     telemetry_valid = execution.stopped != "telemetry_invalid" and usage_events > 0
     if not telemetry_valid and execution.stopped != "telemetry_invalid":
@@ -898,6 +1520,12 @@ def _run(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
                 "ledger_head": ledger_head,
             },
             "post_run_frozen_drift": frozen_drift,
+            "isolation_cleanup": {
+                "broker_stopped": broker_clean,
+                "credential_revoked": not endpoint.credential_path.exists(),
+                "socket_removed": not endpoint.socket_path.exists(),
+                "process_group_clean": execution.process_group_clean,
+            },
         }
     )
     record["artifact_sha256"].update(
@@ -935,6 +1563,22 @@ def _run(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
         return {
             "ok": False,
             "code": "UNOWNED_LAUNCH",
+            "session": record["session_id"],
+        }
+    if execution.stopped in {"broker_failure", "broker_policy"}:
+        return {
+            "ok": False,
+            "code": (
+                "ATTEMPT_BROKER_FAILURE"
+                if execution.stopped == "broker_failure"
+                else "ATTEMPT_BROKER_POLICY"
+            ),
+            "session": record["session_id"],
+        }
+    if not broker_clean or not execution.process_group_clean:
+        return {
+            "ok": False,
+            "code": "SANDBOX_CLEANUP",
             "session": record["session_id"],
         }
     if frozen_drift:
@@ -1050,151 +1694,134 @@ def _validate_development_result(
     return canonical
 
 
-def _attempt(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
-    session_dir = _session_dir(args.session)
-    record = _load_json(session_dir / "session.json")
-    if record.get("state") != "running":
-        raise ControllerError("SESSION_NOT_RUNNING", "development attempts require a running agent")
-    requested_seeds = _parse_seeds(args.seeds)
-    if len(set(requested_seeds)) != len(requested_seeds):
-        raise ControllerError("SEED_DOMAIN", "development attempt seeds must be unique")
-    if not set(requested_seeds) <= set(_parse_seeds(DEVELOPMENT_SEEDS)):
-        raise ControllerError("SEED_DOMAIN", "attempt seeds must stay in the development domain")
+def _execute_authorized_attempt(
+    session_dir: Path,
+    authorized: AuthorizedAttempt,
+    runtime: ControllerRuntime,
+    *,
+    credential_sha256: str,
+) -> dict:
+    """Admit, launch, persist, and settle one already-authenticated locked request."""
 
+    record = _load_json(session_dir / "session.json")
+    if (
+        record.get("state") != "running"
+        or record.get("session_id") != authorized.session_id
+        or record.get("condition") != authorized.condition
+    ):
+        raise ControllerError("SESSION_NOT_RUNNING", "development attempts require a running agent")
     budget = (record.get("budgets") or {}).get("episodes")
     if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
         raise ControllerError("ARTIFACT_INVALID", "session development budget is invalid")
-    candidate = session_dir / str(record.get("candidate", ""))
-    if not candidate.is_file():
-        raise ControllerError("CANDIDATE_MISSING", "assigned candidate is missing")
-    candidate_hash = sha256_file(candidate)
-    worktree = session_dir / str(record.get("worktree", ""))
+    worktree = Path(str(record.get("worktree", ""))).resolve()
+    candidate = (worktree / authorized.candidate_relpath).resolve(strict=True)
+    if (
+        candidate != authorized.candidate
+        or not candidate.is_relative_to(worktree)
+        or not hmac.compare_digest(sha256_file(candidate), authorized.candidate_sha256)
+    ):
+        raise ControllerError("CANDIDATE_HASH", "candidate changed after authorization")
     attempts_path = session_dir / "attempts.jsonl"
+    _, _, charged = _attempt_ledger_state(session_dir)
+    if charged + len(authorized.seeds) > budget:
+        raise ControllerError(
+            "EPISODE_BUDGET", "development attempt exceeds remaining episode budget"
+        )
 
-    with attempts_path.open("a+", encoding="utf-8") as attempts_file:
-        fcntl.flock(attempts_file.fileno(), fcntl.LOCK_EX)
-        try:
-            _, _, charged = _attempt_ledger_state(session_dir)
-            if charged + len(requested_seeds) > budget:
-                raise ControllerError(
-                    "EPISODE_BUDGET", "development attempt exceeds remaining episode budget"
-                )
+    attempt_id = f"dev-{record['session_id']}-{authorized.nonce}"
+    run_dir = worktree / "runs" / attempt_id
+    if run_dir.exists():
+        raise ControllerError("ATTEMPT_RUN_COLLISION", "attempt run ID already exists")
+    admitted_at = runtime.epoch_time()
+    admission_event = {
+        "kind": "dev_attempt_admit",
+        "attempt_id": attempt_id,
+        "nonce": authorized.nonce,
+        "request_sha256": authorized.request_sha256,
+        "credential_sha256": credential_sha256,
+        "condition": record["condition"],
+        "candidate_relpath": authorized.candidate_relpath,
+        "candidate_sha256": authorized.candidate_sha256,
+        "seed_domain": authorized.seed_domain,
+        "seeds": list(authorized.seeds),
+        "requested_episodes": len(authorized.seeds),
+        "admitted_at_epoch": admitted_at,
+    }
+    admission_hash = append_ledger(session_dir / "agent.jsonl", admission_event)
 
-            nonce = _new_nonce()
-            attempt_id = f"dev-{record['session_id']}-{nonce}"
-            run_dir = worktree / "runs" / attempt_id
-            if run_dir.exists():
-                raise ControllerError("ATTEMPT_RUN_COLLISION", "attempt run ID already exists")
-            admission_event = {
-                "kind": "dev_attempt_admit",
-                "attempt_id": attempt_id,
-                "nonce": nonce,
-                "condition": record["condition"],
-                "candidate_sha256": candidate_hash,
-                "seeds": list(requested_seeds),
-                "requested_episodes": len(requested_seeds),
-                "admitted_at_epoch": runtime.epoch_time(),
-                "broker_capability_sha256": (record.get("attempt_broker") or {}).get(
-                    "capability_sha256"
-                ),
-            }
-            admission_hash = append_ledger(session_dir / "agent.jsonl", admission_event)
+    adapter = runtime.adapter_factory(record["condition"], worktree)
+    simulator_started_at = runtime.epoch_time()
+    with _simulator_authority():
+        raw_attempt = adapter.rollout(
+            candidate,
+            ",".join(str(seed) for seed in authorized.seeds),
+            attempt_id,
+        )
+    simulator_ended_at = runtime.epoch_time()
+    attempt = _validate_development_result(
+        raw_attempt,
+        attempt_id=attempt_id,
+        candidate_hash=authorized.candidate_sha256,
+        requested_seeds=authorized.seeds,
+    )
+    attempt_raw = attempt.to_dict()
+    attempt_line = _canonical_json(attempt_raw)
+    attempt_hash = _sha256_text(attempt_line)
+    with attempts_path.open("a", encoding="utf-8") as attempts_file:
+        attempts_file.write(attempt_line + "\n")
+        attempts_file.flush()
+        os.fsync(attempts_file.fileno())
 
-            adapter = runtime.adapter_factory(record["condition"], worktree)
-            raw_attempt = adapter.rollout(candidate, args.seeds, attempt_id)
-            attempt = _validate_development_result(
-                raw_attempt,
-                attempt_id=attempt_id,
-                candidate_hash=candidate_hash,
-                requested_seeds=requested_seeds,
-            )
-            attempt_raw = attempt.to_dict()
-            attempt_line = _canonical_json(attempt_raw)
-            attempt_hash = _sha256_text(attempt_line)
-            attempts_file.seek(0, os.SEEK_END)
-            attempts_file.write(attempt_line + "\n")
-            attempts_file.flush()
-            os.fsync(attempts_file.fileno())
-
-            run_dir.mkdir(parents=True, exist_ok=True)
-            adapter_manifest = run_dir / "manifest.json"
-            adapter_manifest_hash = (
-                sha256_file(adapter_manifest) if adapter_manifest.is_file() else None
-            )
-            controller_manifest = run_dir / "controller_attempt.json"
-            _write_json(
-                controller_manifest,
-                {
-                    "schema_version": 1,
-                    "session_id": record["session_id"],
-                    "condition": record["condition"],
-                    "attempt_id": attempt_id,
-                    "nonce": nonce,
-                    "admission_sha256": admission_hash,
-                    "candidate_sha256": candidate_hash,
-                    "requested_seeds": list(requested_seeds),
-                    "actual_episodes": len(attempt.episodes),
-                    "attempt_sha256": attempt_hash,
-                    "adapter_manifest_sha256": adapter_manifest_hash,
-                },
-            )
-            controller_manifest_hash = sha256_file(controller_manifest)
-            append_ledger(
-                session_dir / "agent.jsonl",
-                {
-                    "kind": "dev_attempt_settle",
-                    "attempt_id": attempt_id,
-                    "admission_sha256": admission_hash,
-                    "requested_episodes": len(requested_seeds),
-                    "actual_episodes": len(attempt.episodes),
-                    "attempt_sha256": attempt_hash,
-                    "controller_manifest_sha256": controller_manifest_hash,
-                    "adapter_manifest_sha256": adapter_manifest_hash,
-                    "settled_at_epoch": runtime.epoch_time(),
-                },
-            )
-        finally:
-            fcntl.flock(attempts_file.fileno(), fcntl.LOCK_UN)
-
+    run_dir.mkdir(parents=True, exist_ok=True)
+    adapter_manifest = run_dir / "manifest.json"
+    adapter_manifest_hash = sha256_file(adapter_manifest) if adapter_manifest.is_file() else None
+    controller_manifest = run_dir / "controller_attempt.json"
+    _write_json(
+        controller_manifest,
+        {
+            "schema_version": 1,
+            "session_id": record["session_id"],
+            "condition": record["condition"],
+            "attempt_id": attempt_id,
+            "nonce": authorized.nonce,
+            "request_sha256": authorized.request_sha256,
+            "credential_sha256": credential_sha256,
+            "admission_sha256": admission_hash,
+            "candidate_relpath": authorized.candidate_relpath,
+            "candidate_sha256": authorized.candidate_sha256,
+            "requested_seeds": list(authorized.seeds),
+            "actual_episodes": len(attempt.episodes),
+            "attempt_sha256": attempt_hash,
+            "adapter_manifest_sha256": adapter_manifest_hash,
+            "simulator_started_at_epoch": simulator_started_at,
+            "simulator_ended_at_epoch": simulator_ended_at,
+        },
+    )
+    controller_manifest_hash = sha256_file(controller_manifest)
+    append_ledger(
+        session_dir / "agent.jsonl",
+        {
+            "kind": "dev_attempt_settle",
+            "attempt_id": attempt_id,
+            "nonce": authorized.nonce,
+            "request_sha256": authorized.request_sha256,
+            "admission_sha256": admission_hash,
+            "requested_episodes": len(authorized.seeds),
+            "actual_episodes": len(attempt.episodes),
+            "attempt_sha256": attempt_hash,
+            "controller_manifest_sha256": controller_manifest_hash,
+            "adapter_manifest_sha256": adapter_manifest_hash,
+            "simulator_started_at_epoch": simulator_started_at,
+            "simulator_ended_at_epoch": simulator_ended_at,
+            "settled_at_epoch": runtime.epoch_time(),
+        },
+    )
     return {
         "ok": True,
-        "session": record["session_id"],
         "attempt_id": attempt_id,
         "episodes_used": len(attempt.episodes),
         "episodes_left": budget - charged - len(attempt.episodes),
-        "attempt": attempt_raw,
     }
-
-
-def _attempt_client(
-    args: argparse.Namespace,
-    environment: dict[str, str] | None = None,
-) -> dict:
-    env = os.environ if environment is None else environment
-    socket_path = env.get("AISLE_ABLATION_SOCKET")
-    capability = env.get("AISLE_ABLATION_CAPABILITY")
-    if not socket_path or not capability:
-        raise ControllerError(
-            "ATTEMPT_BROKER_REQUIRED",
-            "development attempts require the active controller broker",
-        )
-    request = {
-        "capability": capability,
-        "session": args.session,
-        "seeds": args.seeds,
-    }
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(MAX_WALL_HOURS * 3600.0)
-            client.connect(socket_path)
-            client.sendall((_canonical_json(request) + "\n").encode())
-            response_line = client.makefile("r", encoding="utf-8").readline(1024 * 1024)
-        response = json.loads(response_line)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ControllerError("ATTEMPT_BROKER_UNAVAILABLE", str(exc)) from exc
-    if not isinstance(response, dict) or not isinstance(response.get("ok"), bool):
-        raise ControllerError("ATTEMPT_BROKER_PROTOCOL", "broker response is invalid")
-    return response
 
 
 def _heldout_result(attempt: AttemptResult) -> tuple[dict, str | None]:
@@ -1284,7 +1911,7 @@ def _score_locked(
     session_dir: Path,
 ) -> dict:
     record = _load_json(session_dir / "session.json")
-    if record.get("state") == "scoring_started":
+    if record.get("state") in {"scoring_started", "scoring_invalid"}:
         raise ControllerError(
             "SCORING_TERMINAL", "held-out scoring was already admitted and is terminal"
         )
@@ -1298,7 +1925,7 @@ def _score_locked(
         reason = "overlaps development seeds" if requested & development else "is not frozen"
         raise ControllerError("SEED_DOMAIN", f"held-out range {reason}")
     existing = _load_json(session_dir / "holdout.json")
-    if existing.get("state") in {"complete", "scoring_started"}:
+    if existing.get("state") in {"complete", "scoring_started", "invalid"}:
         raise ControllerError("ALREADY_SCORED", "held-out scoring is single-use")
 
     worktree = session_dir / record["worktree"]
@@ -1307,14 +1934,26 @@ def _score_locked(
         record["episode_reservation_release_sha256"] = release_hash
     candidate = session_dir / record["candidate"]
     candidate_hash = sha256_file(candidate) if candidate.is_file() else None
+    component_hashes, _, _, _ = _trusted_run_components(
+        record,
+        runtime,
+        worktree,
+        str(record.get("agent")),
+    )
     nonce = _new_nonce()
     run_id = f"holdout-{record['session_id']}-{nonce}"
     admission = {
         "nonce": nonce,
+        "scorer_nonce": nonce,
         "run_id": run_id,
         "started_at_epoch": runtime.epoch_time(),
         "state": "scoring_started",
         "candidate_sha256": candidate_hash,
+        "heldout_seed_sha256": _seed_hashes()["heldout"],
+        "controller_sha256": sha256_file(Path(__file__)),
+        "adapter_sha256": component_hashes["adapter_sha256"],
+        "runner_sha256": component_hashes["runner_sha256"],
+        "frozen_source_sha256": component_hashes["frozen_source_sha256"],
         "controller_manifest_sha256": None,
         "adapter_manifest_sha256": None,
     }
@@ -1334,58 +1973,86 @@ def _score_locked(
     )
 
     run_dir = worktree / "runs" / run_id
-    if run_dir.exists():
-        raise ControllerError(
-            "HOLDOUT_RUN_COLLISION", "held-out run ID existed before scoring admission"
-        )
-    if not candidate.is_file():
-        result = {
-            "ok": True,
-            "state": "complete",
-            "outcome": "no_deliverable",
-            "pass1": 0.0,
-            "episodes": [],
-            "failures": {},
-            "safety": None,
-        }
-        error_code = None
-    else:
-        adapter = runtime.adapter_factory(record["condition"], worktree)
-        attempt = _validate_holdout_attempt(
-            adapter.rollout(candidate, HELDOUT_SEEDS, run_id),
-            run_id=run_id,
-            candidate_hash=str(candidate_hash),
-        )
-        result, error_code = _heldout_result(attempt)
-        result["state"] = "complete"
+    try:
+        if run_dir.exists():
+            raise ControllerError(
+                "HOLDOUT_RUN_COLLISION", "held-out run ID existed before scoring admission"
+            )
+        if not candidate.is_file():
+            result = {
+                "ok": True,
+                "state": "complete",
+                "outcome": "no_deliverable",
+                "pass1": 0.0,
+                "episodes": [],
+                "failures": {},
+                "safety": None,
+            }
+            error_code = None
+        else:
+            adapter = runtime.adapter_factory(record["condition"], worktree)
+            with _simulator_authority():
+                raw_attempt = adapter.rollout(candidate, HELDOUT_SEEDS, run_id)
+            attempt = _validate_holdout_attempt(
+                raw_attempt,
+                run_id=run_id,
+                candidate_hash=str(candidate_hash),
+            )
+            result, error_code = _heldout_result(attempt)
+            result["state"] = "complete"
 
-        run_dir.mkdir(parents=True, exist_ok=True)
-        attempt_sha256 = _sha256_text(_canonical_json(attempt.to_dict()))
-        adapter_manifest = run_dir / "manifest.json"
-        adapter_manifest_hash = (
-            sha256_file(adapter_manifest) if adapter_manifest.is_file() else None
-        )
-        controller_manifest = run_dir / "controller_holdout.json"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            attempt_sha256 = _sha256_text(_canonical_json(attempt.to_dict()))
+            adapter_manifest = run_dir / "manifest.json"
+            adapter_manifest_hash = (
+                sha256_file(adapter_manifest) if adapter_manifest.is_file() else None
+            )
+            controller_manifest = run_dir / "controller_holdout.json"
+            _write_json(
+                controller_manifest,
+                {
+                    "schema_version": 1,
+                    "session_id": record["session_id"],
+                    "nonce": nonce,
+                    "scorer_nonce": nonce,
+                    "run_id": run_id,
+                    "candidate_sha256": candidate_hash,
+                    "heldout_seed_sha256": admission["heldout_seed_sha256"],
+                    "controller_sha256": admission["controller_sha256"],
+                    "adapter_sha256": admission["adapter_sha256"],
+                    "runner_sha256": admission["runner_sha256"],
+                    "frozen_source_sha256": admission["frozen_source_sha256"],
+                    "attempt_sha256": attempt_sha256,
+                    "adapter_manifest_sha256": adapter_manifest_hash,
+                },
+            )
+            admission.update(
+                {
+                    "state": "complete",
+                    "attempt_sha256": attempt_sha256,
+                    "controller_manifest_sha256": sha256_file(controller_manifest),
+                    "adapter_manifest_sha256": adapter_manifest_hash,
+                }
+            )
+    except Exception as exc:
+        admission["state"] = "invalid"
+        admission["invalid_at_epoch"] = runtime.epoch_time()
+        admission["failure_sha256"] = _sha256_text(type(exc).__name__)
+        record["state"] = "scoring_invalid"
+        _write_json(session_dir / "session.json", record)
         _write_json(
-            controller_manifest,
+            session_dir / "holdout.json",
             {
-                "schema_version": 1,
-                "session_id": record["session_id"],
+                "ok": False,
+                "state": "invalid",
+                "outcome": "infrastructure",
+                "session": record["session_id"],
                 "nonce": nonce,
                 "run_id": run_id,
-                "candidate_sha256": candidate_hash,
-                "attempt_sha256": attempt_sha256,
-                "adapter_manifest_sha256": adapter_manifest_hash,
+                "failure_sha256": admission["failure_sha256"],
             },
         )
-        admission.update(
-            {
-                "state": "complete",
-                "attempt_sha256": attempt_sha256,
-                "controller_manifest_sha256": sha256_file(controller_manifest),
-                "adapter_manifest_sha256": adapter_manifest_hash,
-            }
-        )
+        raise
     result.update({"nonce": nonce, "run_id": run_id})
     _write_json(session_dir / "holdout.json", result)
     record["state"] = "scored"
@@ -1410,7 +2077,7 @@ def _score_locked(
 
 def _score(args: argparse.Namespace, runtime: ControllerRuntime) -> dict:
     session_dir = _session_dir(args.session)
-    with (session_dir / "attempts.jsonl").open("a+", encoding="utf-8") as lock:
+    with (session_dir / "score.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             return _score_locked(args, runtime, session_dir)
@@ -1471,6 +2138,7 @@ def _attempt_correlation(
     issues: set[str] = set()
     admissions: dict[str, list[dict]] = {}
     settlements: dict[str, list[dict]] = {}
+    authenticated_nonces: list[int] = []
     for entry in agent_entries:
         event = entry.get("event")
         if not isinstance(event, dict):
@@ -1484,6 +2152,17 @@ def _attempt_correlation(
             continue
         destination = admissions if kind == "dev_attempt_admit" else settlements
         destination.setdefault(attempt_id, []).append(entry)
+        if kind == "dev_attempt_admit":
+            nonce = event.get("nonce")
+            if isinstance(nonce, bool) or not isinstance(nonce, int):
+                issues.add("ATTEMPT_BROKER_INVALID")
+            else:
+                authenticated_nonces.append(nonce)
+    if any(
+        current <= prior
+        for prior, current in zip(authenticated_nonces, authenticated_nonces[1:], strict=False)
+    ):
+        issues.add("ATTEMPT_BROKER_INVALID")
 
     attempt_records: dict[str, tuple[dict, AttemptResult]] = {}
     for raw in attempts:
@@ -1579,12 +2258,17 @@ def _attempt_correlation(
             or settlement.get("controller_manifest_sha256") != sha256_file(controller_manifest)
             or settlement.get("adapter_manifest_sha256") != adapter_manifest_hash
             or admission.get("candidate_sha256") != attempt.candidate_hash
-            or admission.get("broker_capability_sha256")
-            != (record.get("attempt_broker") or {}).get("capability_sha256")
+            or admission.get("credential_sha256")
+            != (record.get("attempt_broker") or {}).get("credential_sha256")
+            or admission.get("nonce") != settlement.get("nonce")
+            or admission.get("request_sha256") != settlement.get("request_sha256")
             or manifest.get("attempt_id") != attempt_id
             or manifest.get("session_id") != record.get("session_id")
             or manifest.get("condition") != record.get("condition")
             or manifest.get("admission_sha256") != admission_entry.get("sha256")
+            or manifest.get("nonce") != admission.get("nonce")
+            or manifest.get("request_sha256") != admission.get("request_sha256")
+            or manifest.get("credential_sha256") != admission.get("credential_sha256")
             or manifest.get("candidate_sha256") != attempt.candidate_hash
             or manifest.get("requested_seeds") != requested
             or manifest.get("actual_episodes") != actual
@@ -1631,7 +2315,14 @@ def _authorized_holdout(worktree: Path, record: dict) -> str | None:
         manifest.get("session_id") != record.get("session_id")
         or manifest.get("run_id") != run_id
         or manifest.get("nonce") != admission.get("nonce")
+        or manifest.get("scorer_nonce") != admission.get("scorer_nonce")
         or manifest.get("candidate_sha256") != admission.get("candidate_sha256")
+        or manifest.get("heldout_seed_sha256") != _seed_hashes()["heldout"]
+        or admission.get("heldout_seed_sha256") != _seed_hashes()["heldout"]
+        or manifest.get("controller_sha256") != admission.get("controller_sha256")
+        or manifest.get("adapter_sha256") != admission.get("adapter_sha256")
+        or manifest.get("runner_sha256") != admission.get("runner_sha256")
+        or manifest.get("frozen_source_sha256") != admission.get("frozen_source_sha256")
         or manifest.get("adapter_manifest_sha256") != adapter_manifest_hash
         or admission.get("adapter_manifest_sha256") != adapter_manifest_hash
     ):
@@ -1689,7 +2380,7 @@ def _audit_session(
     overlaps: set[str],
 ) -> dict:
     record = _load_json(session_dir / "session.json")
-    worktree = session_dir / record["worktree"]
+    worktree = Path(str(record["worktree"])).resolve(strict=False)
     issues: list[str] = []
     exclusions: list[str] = []
     agent_entries = _read_jsonl(session_dir / "agent.jsonl")
@@ -1713,14 +2404,56 @@ def _audit_session(
         expected_prompt = None
     if provenance.get("prompt_sha256") != expected_prompt:
         issues.append("PROMPT_DRIFT")
+    configured_root = Path(str(record.get("worktrees_root", ""))).resolve(strict=False)
+    if (
+        worktree.parent != configured_root
+        or record.get("worktrees_root_sha256") != _sha256_text(str(configured_root))
+        or record.get("worktree_path_sha256") != _sha256_text(str(worktree))
+    ):
+        issues.append("WORKTREE_CONTAINMENT")
     broker = record.get("attempt_broker")
+    isolation = record.get("isolation")
     if record.get("state") != "prepared" and (
         not isinstance(broker, dict)
         or broker.get("controller_sha256") != provenance.get("runner_sha256")
-        or not isinstance(broker.get("capability_sha256"), str)
-        or len(broker["capability_sha256"]) != 64
+        or not isinstance(broker.get("credential_sha256"), str)
+        or len(broker["credential_sha256"]) != 64
+        or not isinstance(broker.get("broker_id"), str)
+        or not broker.get("broker_id")
+        or not isinstance(isolation, dict)
+        or isolation.get("credential_sha256") != broker.get("credential_sha256")
+        or isolation.get("broker_id") != broker.get("broker_id")
+        or isolation.get("socket_identity_sha256") != broker.get("socket_identity_sha256")
     ):
         issues.append("ATTEMPT_BROKER_INVALID")
+    if record.get("state") != "prepared" and isinstance(isolation, dict):
+        try:
+            current_hashes, _, _, _ = _trusted_run_components(
+                record,
+                runtime,
+                worktree,
+                str(record.get("agent")),
+            )
+        except (ControllerError, OSError, ValueError):
+            current_hashes = {}
+        if not current_hashes or any(
+            isolation.get(key) != value for key, value in current_hashes.items()
+        ):
+            issues.append("ISOLATION_HASH_DRIFT")
+        probe = isolation.get("namespace_probe")
+        probe_ok, _ = native_sandbox.verify_sandbox_probe(probe)
+        if not probe_ok or isolation.get("namespace_probe_sha256") != _sha256_text(
+            _canonical_json(probe)
+        ):
+            issues.append("SANDBOX_PROBE_INVALID")
+        cleanup = record.get("isolation_cleanup")
+        if not isinstance(cleanup, dict) or cleanup != {
+            "broker_stopped": True,
+            "credential_revoked": True,
+            "socket_removed": True,
+            "process_group_clean": True,
+        }:
+            issues.append("SANDBOX_CLEANUP_INVALID")
     if record.get("state") != "prepared":
         try:
             run_prompt_hash = _sha256_text(_session_prompt(record, record["budgets"]))
@@ -1824,12 +2557,18 @@ def _audit_session(
     if record.get("operator_events"):
         issues.append("OPERATOR_INTERVENTION")
         exclusions.append("OPERATOR_INTERVENTION")
+    if record.get("state") in {"scoring_started", "scoring_invalid"}:
+        issues.append("SCORING_TERMINAL_INVALID")
+        exclusions.append("SCORING_TERMINAL_INVALID")
+    if record.get("state") == "scored" and _authorized_holdout(worktree, record) is None:
+        issues.append("SCORING_ATTRIBUTION_INVALID")
+        exclusions.append("SCORING_ATTRIBUTION_INVALID")
     if record.get("observed_unowned_launch"):
         issues.append("UNOWNED_LAUNCH")
         exclusions.append("UNOWNED_LAUNCH")
-    if record.get("session_id") in overlaps:
-        issues.append("CONCURRENT_SIMULATOR")
-        exclusions.append("CONCURRENT_SIMULATOR")
+    # Session wall intervals are not simulator-authority evidence. Attempts
+    # serialize on the controller's global authority lock and carry their own
+    # admission/settlement timestamps.
     rollout_issues, rollout_exclusions = _rollout_contamination(
         worktree, record, development_run_ids
     )
@@ -1925,9 +2664,6 @@ def _parser() -> JsonArgumentParser:
     audit = commands.add_parser("audit")
     audit.add_argument("--dir", type=Path, required=True)
 
-    attempt = commands.add_parser("attempt")
-    attempt.add_argument("--session", required=True)
-    attempt.add_argument("--seeds", required=True)
     return parser
 
 
@@ -1937,7 +2673,6 @@ def main(
     runtime: ControllerRuntime | None = None,
     repo_root: Path = REPO_ROOT,
 ) -> int:
-    runtime_injected = runtime is not None
     runtime = runtime or ControllerRuntime()
     arguments = list(sys.argv[1:] if argv is None else argv)
     if any(argument in {"-h", "--help"} for argument in arguments):
@@ -1963,8 +2698,6 @@ def main(
             result = _run(args, runtime)
         elif args.command == "score":
             result = _score(args, runtime)
-        elif args.command == "attempt":
-            result = _attempt(args, runtime) if runtime_injected else _attempt_client(args)
         else:
             result = _audit(args, runtime)
     except ControllerError as exc:

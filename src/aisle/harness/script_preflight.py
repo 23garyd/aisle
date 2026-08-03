@@ -19,11 +19,15 @@ _KNOWN_CODES = frozenset(
 def _worker_command(path: Path, *, root: Path | None = None) -> list[str]:
     """Build the fixed, isolated module invocation for a candidate policy."""
     if root is not None:
+        trusted_root = root.resolve()
+        candidate = path.resolve()
+        if not candidate.is_relative_to(trusted_root):
+            raise ValueError("candidate is outside the trusted session root")
         return [
             sys.executable,
             "-I",
-            str(root.resolve() / "src" / "aisle" / "harness" / "script_preflight_worker.py"),
-            str(path.resolve()),
+            str(trusted_root / "src" / "aisle" / "harness" / "script_preflight_worker.py"),
+            str(candidate),
         ]
     return [
         sys.executable,
@@ -49,7 +53,7 @@ def preflight_script(path: Path, *, root: Path | None = None) -> PreflightResult
             timeout=_TIMEOUT_S,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, ValueError):
         return _failure("POLICY_INVALID", started)
     try:
         response = json.loads(completed.stdout)
