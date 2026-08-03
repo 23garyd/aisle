@@ -3110,8 +3110,12 @@ def test_native_sandbox_probe_command_is_json_only_and_harmless():
 
 def _execute_native_sandbox_probe(source: str) -> dict:
     stdout = StringIO()
-    with redirect_stdout(stdout):
-        exec(compile(source, "<sandbox-probe>", "exec"), {})
+    original_sys_path = list(sys.path)
+    try:
+        with redirect_stdout(stdout):
+            exec(compile(source, "<sandbox-probe>", "exec"), {})
+    finally:
+        sys.path[:] = original_sys_path
     return json.loads(stdout.getvalue())
 
 
@@ -3253,7 +3257,9 @@ def _sandbox_probe_with_import_locations(source: str, locations: tuple[object, .
     marker = "HOST_PID_NAMESPACE ="
     controlled = source.replace(
         marker,
-        f"IMPORT_SEARCH_LOCATIONS = {locations!r}\n\n{marker}",
+        f"IMPORT_SEARCH_LOCATIONS = {locations!r}\n"
+        "sys.path[:] = IMPORT_SEARCH_LOCATIONS\n\n"
+        f"{marker}",
         1,
     )
     assert controlled != source
@@ -3353,3 +3359,67 @@ def test_native_sandbox_genesis_probe_allows_confirmed_nonexistent_import_path(
     assert inspected == [missing]
     assert find_spec_calls == ["genesis"]
     assert result["genesis_importable"] is False
+
+
+def test_native_sandbox_genesis_probe_rejects_candidate_permission_error(
+    tmp_path: Path, monkeypatch
+):
+    """Native isolation design: FileFinder cannot turn an unreadable candidate safe."""
+    from aisle.harness.native_sandbox import sandbox_probe_command, verify_sandbox_probe
+
+    import_root = tmp_path / "inspectable-import-root"
+    import_root.mkdir()
+    denied_candidate = import_root / "genesis.py"
+    source = _sandbox_probe_with_import_locations(sandbox_probe_command()[3], (str(import_root),))
+    original_stat = Path.stat
+
+    def permission_denied(path: Path, *args, **kwargs):
+        if path == denied_candidate:
+            raise PermissionError("fixture candidate denied beneath FileFinder")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", permission_denied)
+    monkeypatch.setattr("socket.getaddrinfo", lambda *args, **kwargs: [])
+
+    result = _execute_native_sandbox_probe(source)
+    ok, errors = verify_sandbox_probe(result)
+
+    assert result["genesis_importable"] is None
+    assert ok is False
+    assert any("genesis_importable" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("candidate_name", "outside_name", "outside_is_directory"),
+    [
+        ("genesis", "outside-genesis-package", True),
+        ("genesis.py", "outside-genesis-module.py", False),
+    ],
+)
+def test_native_sandbox_genesis_probe_rejects_candidate_symlink_escape(
+    tmp_path: Path,
+    monkeypatch,
+    candidate_name: str,
+    outside_name: str,
+    outside_is_directory: bool,
+):
+    """Native isolation design: package and module candidates stay within their search root."""
+    from aisle.harness.native_sandbox import sandbox_probe_command, verify_sandbox_probe
+
+    import_root = tmp_path / "contained-import-root"
+    import_root.mkdir()
+    outside = tmp_path / outside_name
+    if outside_is_directory:
+        outside.mkdir()
+    else:
+        outside.write_text("VALUE = 1\n")
+    (import_root / candidate_name).symlink_to(outside, target_is_directory=outside_is_directory)
+    source = _sandbox_probe_with_import_locations(sandbox_probe_command()[3], (str(import_root),))
+    monkeypatch.setattr("socket.getaddrinfo", lambda *args, **kwargs: [])
+
+    result = _execute_native_sandbox_probe(source)
+    ok, errors = verify_sandbox_probe(result)
+
+    assert result["genesis_importable"] is None
+    assert ok is False
+    assert any("genesis_importable" in error for error in errors)

@@ -104,6 +104,7 @@ _PROBE_EXPECTED = (
 
 _PROBE_SOURCE_TEMPLATE = textwrap.dedent(
     """\
+    import importlib.machinery
     import importlib.util
     import json
     import os
@@ -160,6 +161,7 @@ _PROBE_SOURCE_TEMPLATE = textwrap.dedent(
         return False
 
     def validate_import_search_locations():
+        validated = []
         for raw_location in IMPORT_SEARCH_LOCATIONS:
             if type(raw_location) is not str or not raw_location:
                 raise ValueError("malformed import search location")
@@ -176,9 +178,55 @@ _PROBE_SOURCE_TEMPLATE = textwrap.dedent(
                     archive.infolist()
             else:
                 raise OSError("unsupported import search location")
+            validated.append((location, mode))
+        return tuple(validated)
+
+    def contained_import_candidate(boundary, candidate):
+        resolved = candidate.resolve(strict=False)
+        if resolved != boundary and not resolved.is_relative_to(boundary):
+            raise OSError("import candidate escaped its search location")
+        return resolved
+
+    def inspect_optional_import_file(boundary, candidate):
+        candidate = contained_import_candidate(boundary, candidate)
+        try:
+            mode = candidate.stat().st_mode
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(mode):
+            raise OSError("unsupported import candidate")
+        with candidate.open("rb") as stream:
+            stream.read(1)
+
+    def inspect_genesis_candidates(search_locations):
+        suffixes = tuple(importlib.machinery.all_suffixes())
+        for location, mode in search_locations:
+            if not stat.S_ISDIR(mode):
+                continue
+
+            package = contained_import_candidate(location, location / "genesis")
+            try:
+                package_mode = package.stat().st_mode
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISDIR(package_mode):
+                    raise OSError("unsupported Genesis package candidate")
+                with os.scandir(package) as entries:
+                    next(entries, None)
+                for suffix in suffixes:
+                    inspect_optional_import_file(
+                        package, package / ("__init__" + suffix)
+                    )
+
+            for suffix in suffixes:
+                inspect_optional_import_file(
+                    location, location / ("genesis" + suffix)
+                )
 
     def genesis_importable():
-        validate_import_search_locations()
+        search_locations = validate_import_search_locations()
+        inspect_genesis_candidates(search_locations)
         return importlib.util.find_spec("genesis") is not None
 
     result = {
