@@ -18,7 +18,17 @@ embodiment:
   arm: [franka]
   gripper: any
   base: [mobile]
-safety_class: decision
-eval: null
+# ADR-5 (ratified 2026-08-03): motion means EMITS ACTUATION COMMANDS, and
+# this runtime emits joint_cmd/gripper_cmd at hard_rt.
+safety_class: motion
+# 0/1 as of the last run: the suite's single case asserts the starter's
+# nav payload carries `target`, but S1StarterStateMachine emits `location`
+# (s1_ablation_common.py:76). Pre-existing, reproduced on the pre-merge
+# tree — recorded honestly rather than backfilled from the passing unit
+# twin (test_script_wrapper_routes_every_motion_command_through_budget_guard).
+eval:
+  suite: tests/graph/test_s1_script_wrapper.py (script wrapper guard routing)
+  pass_rate: 0.0
+  last_run: '2026-08-06'
 origin: hub
 source: src/aisle/nodes/script_s1_runtime.py

@@ -18,7 +18,12 @@ embodiment:
   arm: [franka]
   gripper: any
   base: [mobile]
-safety_class: decision
-eval: null
+# ADR-5 (ratified 2026-08-03): motion means EMITS ACTUATION COMMANDS, and
+# this driver emits joint_cmd/gripper_cmd at hard_rt.
+safety_class: motion
+eval:
+  suite: tests/graph/test_s1_ablation_starters.py (typed starter conformance + safety topology)
+  pass_rate: 1.0
+  last_run: '2026-08-06'
 origin: hub
 source: src/aisle/nodes/s1_ablation_driver.py
